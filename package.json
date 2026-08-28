@@ -111,6 +111,7 @@
     "ip-range-check": "^0.2.0",
     "ipaddr.js": "^2.3.0",
     "jsonwebtoken": "^9.0.3",
+    "kafkajs": "^2.2.4",
     "luxon": "^3.7.2",
     "morgan": "^1.10.1",
     "multer": "^2.1.1",

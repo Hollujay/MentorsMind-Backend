@@ -26,3 +26,12 @@ export class Logger {
     console.error(`[ERROR] [${this.context}] ${message}`, ...args);
   }
 }
+
+/**
+ * Shared logger instance.
+ *
+ * `logger.utils.ts` re-exports this as the canonical `logger`, which 187 modules
+ * import. Without it every `import { logger }` resolves to `undefined` and the
+ * first `logger.info(...)` throws at runtime.
+ */
+export const logger = new Logger('app');
