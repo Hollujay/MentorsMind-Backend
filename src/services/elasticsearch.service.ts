@@ -428,6 +428,42 @@ class ElasticsearchService {
     }
   }
 
+  /**
+   * Prefix search over the mentor `expertise` field, used for query
+   * autocomplete suggestions. Returns matching skill terms ranked by frequency.
+   */
+  async suggestSkills(prefix: string, limit: number = 10): Promise<string[]> {
+    this.ensureConnected();
+
+    try {
+      const response = await this.client!.search({
+        index: config.elasticsearch.indices.mentors,
+        size: 0,
+        query: {
+          prefix: { expertise: prefix.toLowerCase() },
+        },
+        aggregations: {
+          skills: {
+            terms: {
+              field: 'expertise',
+              include: `${prefix.toLowerCase()}.*`,
+              size: limit,
+            },
+          },
+        },
+      });
+
+      return (
+        (response.aggregations?.skills as any)?.buckets?.map(
+          (bucket: any) => bucket.key,
+        ) || []
+      );
+    } catch (error) {
+      logger.error('Suggest skills failed:', error);
+      return [];
+    }
+  }
+
   // Analytics
   async trackSearch(query: string, filters: any, resultsCount: number, userId?: string): Promise<void> {
     this.ensureConnected();

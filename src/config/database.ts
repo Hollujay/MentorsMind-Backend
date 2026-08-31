@@ -1,23 +1,10 @@
 import { trackAndLogQuery } from '../middleware/queryLogger';
-import { Pool, PoolClient, PoolConfig } from "pg";
+import { Pool, PoolClient } from "pg";
 import config from "./index";
 import { logger } from "../utils/logger";
+import { createSecurePoolConfig } from "../database/connection";
 
-export const poolConfig: PoolConfig = {
-  connectionString: config.db.url,
-  host: config.db.host,
-  port: config.db.port,
-  database: config.db.name,
-  user: config.db.user,
-  password: config.db.password,
-  max: config.db.poolMax,
-  min: config.db.poolMin,
-  idleTimeoutMillis: config.db.idleTimeoutMs,
-  connectionTimeoutMillis: config.db.connectionTimeoutMs,
-  statement_timeout: config.db.statementTimeoutMs,
-  query_timeout: config.db.statementTimeoutMs,
-  allowExitOnIdle: false,
-};
+export const poolConfig = createSecurePoolConfig(config.db);
 
 export const pool = new Pool(poolConfig);
 
@@ -39,11 +26,18 @@ export const createOptimizedPool = (): Pool => {
 };
 
 export const testConnection = async (): Promise<boolean> => {
+  const start = Date.now();
   try {
     const client = await pool.connect();
-    logger.info("Database connected successfully");
-    client.release();
-    return true;
+    try {
+      // Basic health check query to ensure database is responsive
+      await client.query('SELECT 1');
+      const latency = Date.now() - start;
+      logger.info({ latencyMs: latency }, "Database connected successfully and is responsive");
+      return true;
+    } finally {
+      client.release();
+    }
   } catch (error) {
     logger.error(
       { error: error instanceof Error ? error.message : error },
@@ -52,6 +46,33 @@ export const testConnection = async (): Promise<boolean> => {
     return false;
   }
 };
+
+// ─── Pool Utilization Monitoring ──────────────────────────────────────────────
+// Periodically logs the connection pool metrics if the pool is under load or
+// just to provide telemetry for dynamic scaling decisions.
+
+let monitorInterval: NodeJS.Timeout | null = null;
+
+export const startPoolMonitoring = (intervalMs = 60000) => {
+  if (monitorInterval) return;
+  monitorInterval = setInterval(() => {
+    const { totalCount, idleCount, waitingCount } = pool;
+    logger.info(
+      { totalCount, idleCount, waitingCount, max: config.db.poolMax },
+      'Database pool utilization telemetry'
+    );
+  }, intervalMs);
+};
+
+export const stopPoolMonitoring = () => {
+  if (monitorInterval) {
+    clearInterval(monitorInterval);
+    monitorInterval = null;
+  }
+};
+
+// Start monitoring automatically
+startPoolMonitoring();
 
 pool.on("error", (err) => {
   logger.error({ error: err.message }, "Unexpected database pool error");
@@ -67,6 +88,9 @@ pool.on("connect", (client) => {
 export const db = {
   query: async (text: string, params?: any[]) => {
     return await trackAndLogQuery(pool, text, params || []);
+  },
+  connect: async () => {
+    return await pool.connect();
   },
 };
 

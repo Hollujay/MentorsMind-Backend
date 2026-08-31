@@ -1,6 +1,6 @@
 import { z } from "zod";
-import dotenv from "dotenv";
-import path from "path";
+import * as dotenv from "dotenv";
+import * as path from "path";
 
 // Load environment-specific .env file, then allow .env.local to override
 const NODE_ENV = process.env.NODE_ENV || "development";

@@ -117,6 +117,48 @@ export const LearningPathController = {
   },
 
   /**
+   * Add a prerequisite to a learning path
+   * POST /api/v1/learning-paths/:pathId/prerequisites
+   */
+  async addPrerequisite(req: Request, res: Response): Promise<void> {
+    try {
+      const { pathId } = req.params as Record<string, string>;
+      const userId = req.user?.id;
+
+      if (!userId) {
+        throw createError(ErrorCode.AUTH_REQUIRED, 401);
+      }
+
+      if (!pathId) {
+        throw createError(ErrorCode.VALIDATION_MISSING_REQUIRED, 400);
+      }
+
+      const prerequisiteData = req.body; // Validation can be added via schema middleware
+      
+      const learningPathService = new LearningPathService();
+      const newPrerequisite = await learningPathService.addPrerequisite(pathId, prerequisiteData);
+
+      logger.info("Prerequisite added via API", {
+        pathId,
+        prerequisiteId: newPrerequisite.id
+      });
+
+      res.status(201).json({
+        success: true,
+        data: newPrerequisite,
+        message: "Prerequisite added successfully"
+      });
+    } catch (error) {
+      logger.error("Failed to add prerequisite via API", {
+        pathId: req.params.pathId,
+        error: error instanceof Error ? error.message : error
+      });
+
+      throw error;
+    }
+  },
+
+  /**
    * Update learning path
    * PUT /api/v1/learning-paths/:pathId
    */

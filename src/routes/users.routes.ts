@@ -14,25 +14,17 @@ import {
 import { idParamSchema } from "../validators/schemas/common.schemas";
 import { RecommendationController } from "../controllers/recommendation.controller";
 import { MAX_AVATAR_SIZE_BYTES } from "../services/upload.service";
+import { createImageUploadMiddleware } from "../middleware/image-upload.middleware";
 
 // ---------------------------------------------------------------------------
 // Multer — in-memory storage for avatar uploads
 // 5 MB hard limit enforced here (UploadService also validates for defence-in-depth)
 // ---------------------------------------------------------------------------
-const avatarUpload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: MAX_AVATAR_SIZE_BYTES },
-  fileFilter: (_req, file, cb) => {
-    const allowed = ['image/jpeg', 'image/png', 'image/webp'];
-    if (allowed.includes(file.mimetype)) {
-      cb(null, true);
-    } else {
-      // Pass error so multer rejects the upload early
-      cb(new multer.MulterError('LIMIT_UNEXPECTED_FILE', file.fieldname));
-    }
-  },
-});
-
+const avatarUpload = createImageUploadMiddleware(MAX_AVATAR_SIZE_BYTES, [
+  'image/jpeg',
+  'image/png',
+  'image/webp',
+]);
 
 const router = Router();
 
