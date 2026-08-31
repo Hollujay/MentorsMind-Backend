@@ -17,7 +17,7 @@
  * with callers that still use it directly.
  */
 
-import crypto from "crypto";
+import * as crypto from "crypto";
 import pool from "../config/database";
 import { logger } from "../utils/logger";
 import { dbQueryDurationMs } from "../config/metrics";
