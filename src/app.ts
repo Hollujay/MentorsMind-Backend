@@ -10,6 +10,7 @@ import {
 import { tracingMiddleware } from "./middleware/tracing.middleware";
 import { requestLoggerMiddleware } from "./middleware/request-logger.middleware";
 import { distributedGeneralLimiter } from "./middleware/distributed-rate-limit.middleware";
+import { dbHealthMiddleware } from "./middleware/db-health.middleware";
 import { errorHandler } from "./middleware/errorHandler";
 import { notFoundHandler } from "./middleware/notFoundHandler";
 import { swaggerOptions } from "./config/swagger";
@@ -31,6 +32,11 @@ import {
 import { logger } from "./utils/logger";
 import { initializeI18n } from "./config/i18n.config";
 import { tenantMiddleware } from "./middleware/tenant.middleware";
+import {
+  memoryDashboardHandler,
+  memoryMonitorMiddleware,
+  startMemoryMonitoring,
+} from "./middleware/memory-monitor.middleware";
 
 const app: Application = express();
 const { apiVersion } = config.server;
@@ -45,10 +51,15 @@ initializeI18n().catch((err) => {
 app.use(tracingMiddleware);
 app.use(blocklistMiddleware);
 
+// DB pool health & circuit breaker
+app.use(dbHealthMiddleware as any);
+
 // Security middleware
 app.use(securityMiddleware);
 app.use(corsMiddleware);
 app.use(requestLoggerMiddleware);
+app.use(memoryMonitorMiddleware());
+startMemoryMonitoring();
 
 // i18n middleware (after request logger, before other middleware)
 app.use(i18nMiddleware);
@@ -152,11 +163,18 @@ app.get(
   requireAdmin as any,
   HealthController.getDetailed,
 );
+app.get(
+  "/admin/memory",
+  authenticate as any,
+  requireAdmin as any,
+  memoryDashboardHandler,
+);
 app.get("/health", (_req, res) => res.redirect("/health/ready"));
 
 // ─── DID Document ────────────────────────────────────────────────────────────
 import { CredentialsController } from "./controllers/credentials.controller";
 app.get("/.well-known/did.json", CredentialsController.getDidDocument);
+app.get("/did/credentials/:credentialId/status", CredentialsController.getCredentialStatus);
 
 // ─── Sunset Exemptions (admin, unversioned so it survives version sunsets) ───
 import sunsetExemptionsRouter from "./routes/admin/sunset-exemptions.routes";

@@ -1,467 +1,370 @@
-/**
- * Predictive auto-scaling tests (issue #862).
- *
- * The decision engine is where the expensive mistakes live — flapping,
- * runaway scale-up, scaling down through a spike — so it is tested
- * exhaustively here without any cloud API.
- */
-
-import {
-  LoadPredictorService,
-  hourOfWeek,
-} from '../load-predictor.service';
 import {
   AutoScalerService,
   DEFAULT_POLICY,
-  instancesFor,
-  type ScalerState,
+  replicasFor,
+  type ScalingExecutor,
   type ScalingPolicy,
-} from '../auto-scaler.service';
+} from "../auto-scaler.service";
+import {
+  LoadPredictorService,
+  MIN_ACTIONABLE_CONFIDENCE,
+  hourOfWeek,
+  linearSlope,
+  type LoadPrediction,
+  type LoadSample,
+} from "../load-predictor.service";
+import { ScalingOptimizerWorker } from "../../workers/scaling-optimizer.worker";
 
-// A fixed Sunday 00:00 UTC so hour-of-week maths is readable.
-const SUNDAY_MIDNIGHT_UTC = Date.UTC(2026, 0, 4, 0, 0, 0);
 const MINUTE = 60_000;
 
-describe('hourOfWeek', () => {
-  it('treats Sunday 00:00 UTC as hour 0', () => {
-    expect(hourOfWeek(SUNDAY_MIDNIGHT_UTC)).toBe(0);
-  });
-
-  it('advances by one per hour', () => {
-    expect(hourOfWeek(SUNDAY_MIDNIGHT_UTC + 3 * 3_600_000)).toBe(3);
-  });
-
-  it('rolls into the next day', () => {
-    // Monday 00:00 = day 1 * 24
-    expect(hourOfWeek(SUNDAY_MIDNIGHT_UTC + 24 * 3_600_000)).toBe(24);
-  });
-});
-
-describe('LoadPredictorService', () => {
-  let predictor: LoadPredictorService;
-
-  beforeEach(() => {
-    predictor = new LoadPredictorService();
-  });
-
-  const feedFlat = (count: number, value: number, start = SUNDAY_MIDNIGHT_UTC) => {
-    for (let i = 0; i < count; i += 1) {
-      predictor.record({ timestamp: start + i * 5 * MINUTE, value });
-    }
+function sample(overrides: Partial<LoadSample> = {}): LoadSample {
+  return {
+    timestamp: Date.UTC(2026, 0, 6, 12, 0, 0),
+    requestsPerSecond: 100,
+    cpuUtilisation: 0.5,
+    p95LatencyMs: 200,
+    ...overrides,
   };
+}
 
-  describe('recording', () => {
-    it('ignores non-finite values', () => {
-      predictor.record({ timestamp: SUNDAY_MIDNIGHT_UTC, value: Number.NaN });
-      predictor.record({ timestamp: SUNDAY_MIDNIGHT_UTC, value: Infinity });
-      // A single NaN from a failed scrape would otherwise poison the EWMA.
-      expect(predictor.sampleCount()).toBe(0);
-    });
+function prediction(overrides: Partial<LoadPrediction> = {}): LoadPrediction {
+  return {
+    requestsPerSecond: 100,
+    confidence: 0.9,
+    basis: { seasonal: null, ewma: 100, trendPerMinute: 0 },
+    seasonalSamples: 0,
+    ...overrides,
+  };
+}
 
-    it('ignores negative load', () => {
-      predictor.record({ timestamp: SUNDAY_MIDNIGHT_UTC, value: -5 });
-      expect(predictor.sampleCount()).toBe(0);
-    });
+function policy(overrides: Partial<ScalingPolicy> = {}): ScalingPolicy {
+  return { ...DEFAULT_POLICY, ...overrides };
+}
 
-    it('ignores a non-finite timestamp', () => {
-      predictor.record({ timestamp: Number.NaN, value: 10 });
-      expect(predictor.sampleCount()).toBe(0);
-    });
-
-    it('evicts oldest samples past the cap', () => {
-      const small = new LoadPredictorService({ maxSamples: 10 });
-      for (let i = 0; i < 25; i += 1) {
-        small.record({ timestamp: SUNDAY_MIDNIGHT_UTC + i * MINUTE, value: i });
-      }
-      expect(small.sampleCount()).toBe(10);
-    });
+describe("predictor maths", () => {
+  it("buckets a timestamp by hour of week", () => {
+    expect(hourOfWeek(Date.UTC(2026, 0, 4, 0, 0, 0))).toBe(0); // Sunday 00:00 UTC
+    expect(hourOfWeek(Date.UTC(2026, 0, 5, 13, 30, 0))).toBe(24 + 13);
   });
 
-  describe('predict', () => {
-    it('returns a zero forecast at zero confidence with no history', () => {
-      const f = predictor.predict(10 * MINUTE);
-      // The caller must not scale on this, and confidence says so explicitly.
-      expect(f.value).toBe(0);
-      expect(f.confidence).toBe(0);
-    });
-
-    it('predicts near the recent level for a flat series', () => {
-      feedFlat(50, 100);
-      const f = predictor.predict(10 * MINUTE, SUNDAY_MIDNIGHT_UTC + 50 * 5 * MINUTE);
-      expect(f.value).toBeGreaterThan(80);
-      expect(f.value).toBeLessThan(130);
-    });
-
-    it('extrapolates an upward trend', () => {
-      for (let i = 0; i < 30; i += 1) {
-        predictor.record({
-          timestamp: SUNDAY_MIDNIGHT_UTC + i * 5 * MINUTE,
-          value: 50 + i * 5,
-        });
-      }
-      const last = SUNDAY_MIDNIGHT_UTC + 29 * 5 * MINUTE;
-      const f = predictor.predict(15 * MINUTE, last);
-
-      // Rising series: the forecast must exceed the smoothed level, or
-      // predictive scaling is pointless.
-      expect(f.baseline).toBeGreaterThan(f.value / (f.seasonalFactor || 1) - 1);
-      expect(f.value).toBeGreaterThan(100);
-    });
-
-    it('never predicts negative load from a falling trend', () => {
-      for (let i = 0; i < 30; i += 1) {
-        predictor.record({
-          timestamp: SUNDAY_MIDNIGHT_UTC + i * 5 * MINUTE,
-          value: Math.max(0, 200 - i * 20),
-        });
-      }
-      const f = predictor.predict(60 * MINUTE, SUNDAY_MIDNIGHT_UTC + 29 * 5 * MINUTE);
-      expect(f.value).toBeGreaterThanOrEqual(0);
-    });
-
-    it('reports the horizon it was asked for', () => {
-      feedFlat(10, 50);
-      expect(predictor.predict(7 * MINUTE).horizonMs).toBe(7 * MINUTE);
-    });
-  });
-
-  describe('seasonality', () => {
-    it('is neutral without enough evidence for the bucket', () => {
-      feedFlat(5, 100);
-      // A thin history degrades to "no adjustment", not a wild guess.
-      expect(predictor.seasonalFactor(99)).toBe(1);
-    });
-
-    it('detects a recurring busy hour', () => {
-      // Three weeks: hour 19 on Sunday runs hot, everything else is quiet.
-      for (let week = 0; week < 3; week += 1) {
-        for (let hour = 0; hour < 24; hour += 1) {
-          const ts =
-            SUNDAY_MIDNIGHT_UTC + week * 7 * 24 * 3_600_000 + hour * 3_600_000;
-          predictor.record({ timestamp: ts, value: hour === 19 ? 300 : 50 });
-        }
-      }
-
-      expect(predictor.seasonalFactor(19)).toBeGreaterThan(1.5);
-      expect(predictor.seasonalFactor(3)).toBeLessThan(1.2);
-    });
-
-    it('clamps an extreme bucket', () => {
-      for (let week = 0; week < 3; week += 1) {
-        for (let hour = 0; hour < 24; hour += 1) {
-          const ts =
-            SUNDAY_MIDNIGHT_UTC + week * 7 * 24 * 3_600_000 + hour * 3_600_000;
-          predictor.record({ timestamp: ts, value: hour === 12 ? 100_000 : 1 });
-        }
-      }
-      // One freak bucket must not authorise a 10x scale-up a week later.
-      expect(predictor.seasonalFactor(12)).toBeLessThanOrEqual(3);
-    });
-
-    it('handles an all-zero series without dividing by zero', () => {
-      feedFlat(30, 0);
-      expect(predictor.seasonalFactor(0)).toBe(1);
-      expect(Number.isFinite(predictor.predict(MINUTE).value)).toBe(true);
-    });
-  });
-
-  describe('confidence', () => {
-    it('is zero with fewer than two samples', () => {
-      predictor.record({ timestamp: SUNDAY_MIDNIGHT_UTC, value: 10 });
-      expect(predictor.confidence()).toBe(0);
-    });
-
-    it('rises with more samples', () => {
-      feedFlat(10, 100);
-      const few = predictor.confidence();
-
-      predictor.reset();
-      feedFlat(100, 100);
-      expect(predictor.confidence()).toBeGreaterThan(few);
-    });
-
-    it('is lower for an erratic series than a stable one', () => {
-      feedFlat(100, 100);
-      const stable = predictor.confidence();
-
-      predictor.reset();
-      for (let i = 0; i < 100; i += 1) {
-        predictor.record({
-          timestamp: SUNDAY_MIDNIGHT_UTC + i * 5 * MINUTE,
-          value: i % 2 === 0 ? 5 : 400,
-        });
-      }
-      expect(predictor.confidence()).toBeLessThan(stable);
-    });
-
-    it('stays within 0 and 1', () => {
-      feedFlat(500, 42);
-      const c = predictor.confidence();
-      expect(c).toBeGreaterThanOrEqual(0);
-      expect(c).toBeLessThanOrEqual(1);
-    });
-  });
-
-  it('computes a median sample interval robust to gaps', () => {
-    predictor.record({ timestamp: 0, value: 1 });
-    predictor.record({ timestamp: 5 * MINUTE, value: 1 });
-    predictor.record({ timestamp: 10 * MINUTE, value: 1 });
-    predictor.record({ timestamp: 120 * MINUTE, value: 1 }); // scrape gap
-
-    expect(predictor.medianIntervalMs()).toBe(5 * MINUTE);
+  it("reports a flat series as no trend and a rising one as positive", () => {
+    expect(linearSlope([5, 5, 5, 5])).toBe(0);
+    expect(linearSlope([1, 2, 3, 4])).toBeCloseTo(1);
+    expect(linearSlope([4, 3, 2, 1])).toBeCloseTo(-1);
+    expect(linearSlope([7])).toBe(0);
   });
 });
 
-describe('instancesFor', () => {
-  it('accounts for target utilisation headroom', () => {
-    // 100 capacity at 70% target = 70 usable per instance.
-    expect(instancesFor(140, DEFAULT_POLICY)).toBe(2);
-    expect(instancesFor(141, DEFAULT_POLICY)).toBe(3);
+describe("LoadPredictorService", () => {
+  it("predicts nothing with no confidence when it has no history", () => {
+    const result = new LoadPredictorService().predict();
+    expect(result).toMatchObject({ requestsPerSecond: 0, confidence: 0 });
   });
 
-  it('returns zero for no load', () => {
-    expect(instancesFor(0, DEFAULT_POLICY)).toBe(0);
-  });
-});
-
-describe('AutoScalerService', () => {
-  let scaler: AutoScalerService;
-  const now = SUNDAY_MIDNIGHT_UTC;
-
-  const state = (over: Partial<ScalerState> = {}): ScalerState => ({
-    currentInstances: 4,
-    lastScaledAt: null,
-    lastAction: null,
-    ...over,
-  });
-
-  const policy = (over: Partial<ScalingPolicy> = {}): ScalingPolicy => ({
-    ...DEFAULT_POLICY,
-    ...over,
-  });
-
-  beforeEach(() => {
-    scaler = new AutoScalerService();
-  });
-
-  describe('reactive scaling', () => {
-    it('scales up when observed load exceeds capacity', () => {
-      const d = scaler.decide({ state: state(), observedLoad: 500, now });
-      expect(d.action).toBe('scale-up');
-      expect(d.targetInstances).toBeGreaterThan(4);
-    });
-
-    it('holds when load matches current capacity', () => {
-      // 4 instances × 70 usable = 280
-      const d = scaler.decide({ state: state(), observedLoad: 280, now });
-      expect(d.action).toBe('hold');
-    });
-
-    it('scales down when load drops', () => {
-      const d = scaler.decide({ state: state({ currentInstances: 8 }), observedLoad: 70, now });
-      expect(d.action).toBe('scale-down');
-    });
-
-    it('treats a non-finite observed load as zero', () => {
-      const d = scaler.decide({
-        state: state({ currentInstances: 2 }),
-        observedLoad: Number.NaN,
-        now,
-      });
-      expect(d.action).toBe('hold');
-      expect(d.effectiveLoad).toBe(0);
-    });
-  });
-
-  describe('predictive scaling', () => {
-    const forecast = (value: number, confidence: number) => ({
-      value,
-      confidence,
-      horizonMs: 10 * MINUTE,
-      baseline: value,
-      seasonalFactor: 1,
-    });
-
-    it('provisions early for a trusted forecast above observed load', () => {
-      const d = scaler.decide({
-        state: state(),
-        observedLoad: 100,
-        forecast: forecast(600, 0.9),
-        now,
-      });
-
-      expect(d.action).toBe('scale-up');
-      expect(d.predictive).toBe(true);
-      expect(d.reason).toMatch(/forecast/i);
-    });
-
-    it('ignores a forecast below the confidence threshold', () => {
-      // Observed load exactly fills the current 4 instances (4 x 70 = 280), so
-      // the only thing that could move the needle is the forecast.
-      const d = scaler.decide({
-        state: state(),
-        observedLoad: 280,
-        forecast: forecast(600, 0.1),
-        now,
-      });
-      // Acting on a low-confidence spike prediction is how a scaler burns money.
-      expect(d.action).toBe('hold');
-      expect(d.predictive).toBe(false);
-    });
-
-    it('never scales down on a forecast alone', () => {
-      const d = scaler.decide({
-        state: state({ currentInstances: 8 }),
-        observedLoad: 500,
-        forecast: forecast(10, 0.95),
-        now,
-      });
-      // Observed load still needs the capacity; the forecast must not remove it.
-      expect(d.action).not.toBe('scale-down');
-    });
-
-    it('blocks a scale-down while the forecast still needs the capacity', () => {
-      const d = scaler.decide({
-        state: state({ currentInstances: 8 }),
-        observedLoad: 70,
-        forecast: forecast(560, 0.9),
-        now,
-      });
-
-      expect(d.action).toBe('hold');
-      expect(d.reason).toMatch(/forecast still requires/i);
-    });
-  });
-
-  describe('cooldowns', () => {
-    it('blocks a second scale-up inside the cooldown', () => {
-      const d = scaler.decide({
-        state: state({ lastScaledAt: now - 10_000, lastAction: 'scale-up' }),
-        observedLoad: 900,
-        now,
-      });
-
-      expect(d.action).toBe('hold');
-      expect(d.reason).toMatch(/cooling down/i);
-    });
-
-    it('allows a scale-up after the cooldown lapses', () => {
-      const d = scaler.decide({
-        state: state({ lastScaledAt: now - 120_000, lastAction: 'scale-up' }),
-        observedLoad: 900,
-        now,
-      });
-      expect(d.action).toBe('scale-up');
-    });
-
-    it('allows an immediate scale-up after a scale-down', () => {
-      const d = scaler.decide({
-        state: state({ lastScaledAt: now - 5_000, lastAction: 'scale-down' }),
-        observedLoad: 900,
-        now,
-      });
-      // Otherwise the scaler sits under-provisioned through its own cooldown.
-      expect(d.action).toBe('scale-up');
-    });
-
-    it('blocks a scale-down inside the longer down cooldown', () => {
-      const d = scaler.decide({
-        state: state({ currentInstances: 8, lastScaledAt: now - 60_000, lastAction: 'scale-up' }),
-        observedLoad: 70,
-        now,
-      });
-
-      expect(d.action).toBe('hold');
-      expect(d.reason).toMatch(/cooldown/i);
-    });
-
-    it('has no cooldown before the first action', () => {
-      const d = scaler.decide({ state: state({ lastScaledAt: null }), observedLoad: 900, now });
-      expect(d.action).toBe('scale-up');
-    });
-  });
-
-  describe('limits', () => {
-    it('clamps to maxInstances', () => {
-      const d = scaler.decide({
-        state: state(),
-        observedLoad: 999_999,
-        policy: policy({ maxInstances: 6 }),
-        now,
-      });
-
-      expect(d.targetInstances).toBe(6);
-      expect(d.constrainedBy).toBe('max');
-    });
-
-    it('never drops below minInstances', () => {
-      const d = scaler.decide({
-        state: state({ currentInstances: 3, lastScaledAt: null }),
-        observedLoad: 0,
-        policy: policy({ minInstances: 2, maxScaleDownStep: 10 }),
-        now,
-      });
-
-      expect(d.targetInstances).toBeGreaterThanOrEqual(2);
-    });
-
-    it('reports the cost ceiling as the binding constraint', () => {
-      const d = scaler.decide({
-        state: state(),
-        observedLoad: 999_999,
-        policy: policy({ maxInstances: 50, costCeilingInstances: 8 }),
-        now,
-      });
-
-      // An operator debugging "why am I stuck at 8?" needs the real reason.
-      expect(d.targetInstances).toBe(8);
-      expect(d.constrainedBy).toBe('cost-ceiling');
-    });
-
-    it('steps down gradually rather than in one cut', () => {
-      const d = scaler.decide({
-        state: state({ currentInstances: 12, lastScaledAt: null }),
-        observedLoad: 0,
-        policy: policy({ maxScaleDownStep: 2, minInstances: 1 }),
-        now,
-      });
-
-      // A single large cut turns a lull into an outage when traffic returns.
-      expect(d.targetInstances).toBe(10);
-      expect(d.constrainedBy).toBe('scale-down-step');
-    });
-  });
-
-  describe('applyDecision', () => {
-    it('records the new instance count and timestamp', () => {
-      const before = state();
-      const decision = scaler.decide({ state: before, observedLoad: 900, now });
-      const after = scaler.applyDecision(before, decision, now);
-
-      expect(after.currentInstances).toBe(decision.targetInstances);
-      expect(after.lastScaledAt).toBe(now);
-      expect(after.lastAction).toBe('scale-up');
-    });
-
-    it('leaves state untouched on a hold', () => {
-      const before = state();
-      const decision = scaler.decide({ state: before, observedLoad: 280, now });
-      expect(scaler.applyDecision(before, decision, now)).toBe(before);
-    });
-  });
-
-  it('does not flap between up and down on steady load', () => {
-    let current = state({ currentInstances: 4 });
-    let clock = now;
-    const actions: string[] = [];
-
-    for (let i = 0; i < 10; i += 1) {
-      const decision = scaler.decide({ state: current, observedLoad: 280, now: clock });
-      actions.push(decision.action);
-      current = scaler.applyDecision(current, decision, clock);
-      clock += 30_000;
+  it("projects a rising trend forward", () => {
+    const predictor = new LoadPredictorService();
+    const base = Date.UTC(2026, 0, 6, 12, 0, 0);
+    for (let i = 0; i < 10; i++) {
+      predictor.record(
+        sample({
+          timestamp: base + i * MINUTE,
+          requestsPerSecond: 100 + i * 10,
+        }),
+      );
     }
 
-    expect(actions.every((a) => a === 'hold')).toBe(true);
+    const result = predictor.predict(5, base + 9 * MINUTE);
+
+    expect(result.basis.trendPerMinute).toBeGreaterThan(0);
+    expect(result.requestsPerSecond).toBeGreaterThan(result.basis.ewma ?? 0);
+  });
+
+  it("uses the seasonal baseline once the bucket has enough samples", () => {
+    const predictor = new LoadPredictorService();
+    // Three prior weeks of the same hour-of-week bucket at a much higher rate.
+    for (let week = 1; week <= 3; week++) {
+      predictor.record(
+        sample({
+          timestamp: Date.UTC(2026, 0, 6 - 7 * week, 12, 5, 0),
+          requestsPerSecond: 500,
+        }),
+      );
+    }
+    // The current sample sits in the 11:00 bucket, so the 12:00 bucket the
+    // horizon lands in holds only the three historical weeks.
+    predictor.record(
+      sample({
+        timestamp: Date.UTC(2026, 0, 6, 11, 55, 0),
+        requestsPerSecond: 100,
+      }),
+    );
+
+    const result = predictor.predict(5, Date.UTC(2026, 0, 6, 11, 56, 0));
+
+    expect(result.basis.seasonal).toBeCloseTo(500);
+    expect(result.requestsPerSecond).toBeGreaterThan(100);
+    expect(result.seasonalSamples).toBe(3);
+  });
+
+  it("is less confident when the seasonal baseline and the projection disagree", () => {
+    const agreeing = new LoadPredictorService();
+    const disagreeing = new LoadPredictorService();
+    const at = Date.UTC(2026, 0, 6, 12, 0, 0);
+
+    for (let i = 0; i < 10; i++) {
+      agreeing.record(
+        sample({ timestamp: at - (10 - i) * MINUTE, requestsPerSecond: 100 }),
+      );
+      disagreeing.record(
+        sample({ timestamp: at - (10 - i) * MINUTE, requestsPerSecond: 100 }),
+      );
+    }
+    for (let week = 1; week <= 3; week++) {
+      agreeing.record(
+        sample({
+          timestamp: at - week * 7 * 24 * 60 * MINUTE + 5 * MINUTE,
+          requestsPerSecond: 100,
+        }),
+      );
+      disagreeing.record(
+        sample({
+          timestamp: at - week * 7 * 24 * 60 * MINUTE + 5 * MINUTE,
+          requestsPerSecond: 900,
+        }),
+      );
+    }
+
+    expect(disagreeing.predict(5, at).confidence).toBeLessThan(
+      agreeing.predict(5, at).confidence,
+    );
+  });
+
+  it("caps retained history", () => {
+    const predictor = new LoadPredictorService(5);
+    for (let i = 0; i < 20; i++)
+      predictor.record(sample({ timestamp: Date.now() + i }));
+    expect(predictor.sampleCount).toBe(5);
+  });
+});
+
+describe("replicasFor", () => {
+  it("adds headroom and rounds up", () => {
+    // 100 rps * 1.2 headroom / 50 per replica = 2.4 → 3
+    expect(replicasFor(100, policy())).toBe(3);
+  });
+
+  it("never goes below the floor or above the ceiling", () => {
+    expect(replicasFor(0, policy())).toBe(2);
+    expect(replicasFor(100_000, policy())).toBe(20);
+  });
+});
+
+describe("AutoScalerService.decide", () => {
+  it("scales up on an SLO breach regardless of the forecast", () => {
+    const scaler = new AutoScalerService(policy());
+
+    const decision = scaler.decide(
+      3,
+      prediction({ requestsPerSecond: 10, confidence: 0.9 }),
+      sample({ p95LatencyMs: 900, requestsPerSecond: 100 }),
+    );
+
+    expect(decision.action).toBe("scale-up");
+    expect(decision.desiredReplicas).toBeGreaterThan(3);
+    expect(decision.reason).toMatch(/exceeds the 500ms SLO/);
+  });
+
+  it("holds when the prediction is not trusted", () => {
+    const scaler = new AutoScalerService(policy());
+
+    const decision = scaler.decide(
+      2,
+      prediction({
+        requestsPerSecond: 5_000,
+        confidence: MIN_ACTIONABLE_CONFIDENCE - 0.01,
+      }),
+      sample(),
+    );
+
+    expect(decision.action).toBe("hold");
+    expect(decision.desiredReplicas).toBe(2);
+    expect(decision.reason).toMatch(/confidence/);
+  });
+
+  it("scales up ahead of predicted load", () => {
+    const scaler = new AutoScalerService(policy());
+
+    const decision = scaler.decide(
+      2,
+      prediction({ requestsPerSecond: 400 }),
+      sample(),
+    );
+
+    expect(decision.action).toBe("scale-up");
+    expect(decision.desiredReplicas).toBe(10); // 400 * 1.2 / 50
+  });
+
+  it("never removes more than one replica per step", () => {
+    const scaler = new AutoScalerService(policy({ minReplicas: 1 }));
+
+    const decision = scaler.decide(
+      10,
+      prediction({ requestsPerSecond: 10 }),
+      sample(),
+    );
+
+    expect(decision.action).toBe("scale-down");
+    expect(decision.desiredReplicas).toBe(9);
+  });
+
+  it("holds when already correctly sized", () => {
+    const scaler = new AutoScalerService(policy());
+    expect(
+      scaler.decide(3, prediction({ requestsPerSecond: 100 }), sample()).action,
+    ).toBe("hold");
+  });
+});
+
+describe("AutoScalerService.apply", () => {
+  function executor(
+    start: number,
+  ): ScalingExecutor & { replicas: number; calls: number[] } {
+    return {
+      replicas: start,
+      calls: [] as number[],
+      async currentReplicas() {
+        return this.replicas;
+      },
+      async scaleTo(n: number) {
+        this.calls.push(n);
+        this.replicas = n;
+      },
+    };
+  }
+
+  it("applies a scale-up and then respects the cooldown", async () => {
+    const exec = executor(2);
+    const scaler = new AutoScalerService(policy(), exec);
+    const now = Date.now();
+
+    const first = await scaler.apply(
+      prediction({ requestsPerSecond: 400 }),
+      sample(),
+      now,
+    );
+    expect(first.action).toBe("scale-up");
+    expect(exec.replicas).toBe(10);
+
+    const second = await scaler.apply(
+      prediction({ requestsPerSecond: 900 }),
+      sample(),
+      now + 10_000,
+    );
+    expect(second.action).toBe("hold");
+    expect(second.reason).toMatch(/cooling down/);
+    expect(exec.calls).toHaveLength(1);
+  });
+
+  it("allows a further scale-up once the cooldown has passed", async () => {
+    const exec = executor(2);
+    const scaler = new AutoScalerService(policy(), exec);
+    const now = Date.now();
+
+    await scaler.apply(prediction({ requestsPerSecond: 200 }), sample(), now);
+    const later = await scaler.apply(
+      prediction({ requestsPerSecond: 900 }),
+      sample(),
+      now + 61_000,
+    );
+
+    expect(later.action).toBe("scale-up");
+    expect(exec.calls).toHaveLength(2);
+  });
+
+  it("holds a scale-down inside the longer cooldown", async () => {
+    const exec = executor(10);
+    const scaler = new AutoScalerService(policy({ minReplicas: 1 }), exec);
+    const now = Date.now();
+
+    await scaler.apply(prediction({ requestsPerSecond: 10 }), sample(), now);
+    const second = await scaler.apply(
+      prediction({ requestsPerSecond: 10 }),
+      sample(),
+      now + 120_000,
+    );
+
+    expect(second.action).toBe("hold");
+    expect(exec.replicas).toBe(9);
+  });
+
+  it("refuses to apply without an executor", async () => {
+    const scaler = new AutoScalerService(policy());
+    await expect(scaler.apply(prediction(), sample())).rejects.toThrow(
+      /requires an executor/,
+    );
+  });
+});
+
+describe("ScalingOptimizerWorker", () => {
+  function build(overrides: { sample?: () => Promise<LoadSample> } = {}) {
+    const exec = {
+      replicas: 2,
+      async currentReplicas() {
+        return this.replicas;
+      },
+      async scaleTo(n: number) {
+        this.replicas = n;
+      },
+    };
+    const worker = new ScalingOptimizerWorker({
+      metrics: {
+        sample:
+          overrides.sample ?? (async () => sample({ requestsPerSecond: 400 })),
+      },
+      scaler: new AutoScalerService(policy(), exec),
+      predictor: new LoadPredictorService(),
+    });
+    return { worker, exec };
+  }
+
+  it("samples, predicts and scales in one tick", async () => {
+    const { worker, exec } = build();
+
+    const decision = await worker.tick();
+
+    expect(decision).not.toBeNull();
+    expect(worker.history()).toHaveLength(1);
+    expect(exec.replicas).toBeGreaterThanOrEqual(2);
+  });
+
+  it("survives a failing metrics source", async () => {
+    const { worker, exec } = build({
+      sample: async () => {
+        throw new Error("prometheus unreachable");
+      },
+    });
+
+    expect(await worker.tick()).toBeNull();
+    expect(worker.failureStreak).toBe(1);
+    expect(exec.replicas).toBe(2);
+  });
+
+  it("summarises decisions for cost reporting", async () => {
+    const { worker } = build();
+    await worker.tick();
+    await worker.tick();
+
+    const report = worker.costReport();
+    expect(report.scaleUps + report.scaleDowns + report.holds).toBe(2);
+  });
+
+  it("start and stop are idempotent", () => {
+    const { worker } = build();
+    worker.start();
+    worker.start();
+    expect(worker.running).toBe(true);
+    worker.stop();
+    worker.stop();
+    expect(worker.running).toBe(false);
   });
 });

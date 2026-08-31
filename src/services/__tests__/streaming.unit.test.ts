@@ -1,654 +1,651 @@
-/**
- * Stream processing, event sourcing and Kafka adapter tests (issue #861).
- *
- * Everything here runs against injected fakes — no broker required.
- */
-
-import {
-  StreamProcessor,
-  WindowAggregator,
-  windowStartFor,
-  type StreamMessage,
-} from '../stream-processor.service';
-import {
-  CommandBus,
-  ConcurrencyError,
-  EventSourcingService,
-  InMemoryEventStore,
-  type DomainEvent,
-  type Projection,
-} from '../event-sourcing.service';
 import {
   KafkaProducerService,
-  serialiseValue,
-  type ProducerClient,
-  type ProducerRecord,
-} from '../kafka-producer.service';
+  buildEnvelope,
+  groupByTopic,
+  type DriverRecord,
+  type EventEnvelope,
+  type KafkaProducerDriver,
+  type OutboundMessage,
+} from "../kafka-producer.service";
 import {
   KafkaConsumerService,
-  toStreamMessage,
-  type ConsumerClient,
-  type ConsumerRecord,
-} from '../kafka-consumer.service';
+  deadLetterTopicFor,
+  parseEnvelope,
+  type ConsumedMessage,
+} from "../kafka-consumer.service";
+import {
+  StreamProcessorService,
+  countAggregator,
+  distinctAggregator,
+  sumAggregator,
+  windowStartFor,
+  type WindowedResult,
+} from "../stream-processor.service";
+import {
+  ConcurrencyError,
+  EventSourcingService,
+  InMemoryEventJournal,
+  type Aggregate,
+  type StoredEvent,
+} from "../event-sourcing.service";
 
-const msg = <T>(over: Partial<StreamMessage<T>> = {}): StreamMessage<T> =>
-  ({
-    topic: 'events',
-    key: 'k1',
-    value: 1 as unknown as T,
-    timestamp: 1_000,
-    ...over,
-  }) as StreamMessage<T>;
+const noSleep = async () => {};
 
-// ─── Windowing ────────────────────────────────────────────────────────────────
+function envelope(overrides: Partial<EventEnvelope> = {}): EventEnvelope {
+  return {
+    eventId: "evt-1",
+    eventType: "session.booked",
+    version: 1,
+    key: "mentor-1",
+    occurredAt: new Date(1_700_000_000_000).toISOString(),
+    correlationId: "corr-1",
+    payload: {},
+    ...overrides,
+  };
+}
 
-describe('windowStartFor', () => {
-  it('floors to the window grid', () => {
-    expect(windowStartFor(1_250, 1_000)).toBe(1_000);
-    expect(windowStartFor(2_000, 1_000)).toBe(2_000);
-  });
+function consumed(overrides: Partial<ConsumedMessage> = {}): ConsumedMessage {
+  return {
+    topic: "sessions",
+    partition: 0,
+    offset: "1",
+    key: "mentor-1",
+    value: JSON.stringify(envelope()),
+    headers: {},
+    ...overrides,
+  };
+}
 
-  it('is stable across restarts for the same timestamp', () => {
-    // Deriving windows from "first message seen" would give a different grid
-    // every deploy, and two replicas would disagree.
-    expect(windowStartFor(123_456, 60_000)).toBe(windowStartFor(123_456, 60_000));
-  });
-});
+// ─── Producer ────────────────────────────────────────────────────────────────
 
-describe('WindowAggregator', () => {
-  const counter = (over = {}) =>
-    new WindowAggregator<number, number>({
-      windowMs: 1_000,
-      initial: () => 0,
-      reduce: (acc) => acc + 1,
-      ...over,
+class RecordingDriver implements KafkaProducerDriver {
+  sent: DriverRecord[] = [];
+  connects = 0;
+  failuresRemaining = 0;
+
+  async connect(): Promise<void> {
+    this.connects++;
+  }
+  async send(record: DriverRecord): Promise<void> {
+    if (this.failuresRemaining > 0) {
+      this.failuresRemaining--;
+      throw new Error("broker unavailable");
+    }
+    this.sent.push(record);
+  }
+  async disconnect(): Promise<void> {}
+}
+
+describe("buildEnvelope", () => {
+  it("stamps an id, timestamp and default version", () => {
+    const e = buildEnvelope({
+      topic: "t",
+      key: "k",
+      eventType: "x",
+      payload: { a: 1 },
     });
-
-  it('aggregates messages inside one window', () => {
-    const closed: Array<{ result: number }> = [];
-    const agg = counter({ onWindowClosed: (r: { result: number }) => closed.push(r) });
-
-    agg.add(msg({ timestamp: 1_000 }));
-    agg.add(msg({ timestamp: 1_500 }));
-    agg.flush();
-
-    expect(closed[0].result).toBe(2);
+    expect(e.eventId).toHaveLength(36);
+    expect(e.version).toBe(1);
+    expect(e.payload).toEqual({ a: 1 });
   });
 
-  it('separates messages into distinct windows', () => {
-    const closed: Array<{ windowStart: number; result: number }> = [];
-    const agg = counter({ onWindowClosed: (r: never) => closed.push(r) });
-
-    agg.add(msg({ timestamp: 1_000 }));
-    agg.add(msg({ timestamp: 2_500 }));
-    agg.flush();
-
-    expect(closed).toHaveLength(2);
-  });
-
-  it('keys windows separately', () => {
-    const closed: Array<{ key: string | null; result: number }> = [];
-    const agg = counter({ onWindowClosed: (r: never) => closed.push(r) });
-
-    agg.add(msg({ timestamp: 1_000, key: 'a' }));
-    agg.add(msg({ timestamp: 1_100, key: 'b' }));
-    agg.flush();
-
-    expect(closed.map((c) => c.key).sort()).toEqual(['a', 'b']);
-  });
-
-  it('closes a window once the watermark passes it', () => {
-    const closed: unknown[] = [];
-    const agg = counter({ onWindowClosed: (r: unknown) => closed.push(r) });
-
-    agg.add(msg({ timestamp: 1_000 }));
-    expect(closed).toHaveLength(0);
-
-    agg.add(msg({ timestamp: 3_000 }));
-    expect(closed).toHaveLength(1);
-  });
-
-  it('accepts a late arrival inside the grace period', () => {
-    const late: unknown[] = [];
-    const agg = counter({ graceMs: 5_000, onLateMessage: (m: unknown) => late.push(m) });
-
-    agg.add(msg({ timestamp: 1_000 }));
-    agg.add(msg({ timestamp: 4_000 }));
-    // Window [1000,2000) closes at watermark 7000; 1500 is still in grace.
-    expect(agg.add(msg({ timestamp: 1_500 }))).toBe(true);
-    expect(late).toHaveLength(0);
-  });
-
-  it('drops an arrival too late even for grace', () => {
-    const late: unknown[] = [];
-    const agg = counter({ graceMs: 0, onLateMessage: (m: unknown) => late.push(m) });
-
-    agg.add(msg({ timestamp: 1_000 }));
-    agg.add(msg({ timestamp: 9_000 }));
-
-    // Re-opening an emitted window would produce a second, contradictory
-    // result downstream.
-    expect(agg.add(msg({ timestamp: 1_200 }))).toBe(false);
-    expect(late).toHaveLength(1);
-  });
-
-  it('never moves the watermark backwards', () => {
-    const agg = counter();
-    agg.add(msg({ timestamp: 5_000 }));
-    agg.add(msg({ timestamp: 2_000 }));
-    expect(agg.currentWatermark()).toBe(5_000);
-  });
-
-  it('flushes open windows at shutdown', () => {
-    const closed: unknown[] = [];
-    const agg = counter({ onWindowClosed: (r: unknown) => closed.push(r) });
-
-    agg.add(msg({ timestamp: 1_000 }));
-    expect(agg.openWindowCount()).toBe(1);
-
-    agg.flush();
-    expect(agg.openWindowCount()).toBe(0);
-    expect(closed).toHaveLength(1);
-  });
-
-  it('reports message counts per window', () => {
-    const closed: Array<{ messageCount: number }> = [];
-    const agg = counter({ onWindowClosed: (r: never) => closed.push(r) });
-
-    agg.add(msg({ timestamp: 1_000 }));
-    agg.add(msg({ timestamp: 1_100 }));
-    agg.add(msg({ timestamp: 1_200 }));
-    agg.flush();
-
-    expect(closed[0].messageCount).toBe(3);
+  it("gives each message a distinct id", () => {
+    const message: OutboundMessage = {
+      topic: "t",
+      key: "k",
+      eventType: "x",
+      payload: {},
+    };
+    expect(buildEnvelope(message).eventId).not.toBe(
+      buildEnvelope(message).eventId,
+    );
   });
 });
 
-// ─── Processing ───────────────────────────────────────────────────────────────
-
-describe('StreamProcessor', () => {
-  it('processes a clean batch', async () => {
-    const handler = jest.fn().mockResolvedValue(undefined);
-    const result = await new StreamProcessor({ handler }).processBatch([msg(), msg()]);
-
-    expect(result.processed).toBe(2);
-    expect(result.failed).toBe(0);
-  });
-
-  it('retries a failing message up to the attempt limit', async () => {
-    const handler = jest
-      .fn()
-      .mockRejectedValueOnce(new Error('transient'))
-      .mockResolvedValue(undefined);
-
-    const result = await new StreamProcessor({ handler, maxAttempts: 3 }).processBatch([
-      msg(),
+describe("groupByTopic", () => {
+  it("collapses messages into one record per topic with headers", () => {
+    const records = groupByTopic([
+      { topic: "a", envelope: envelope({ key: "k1" }) },
+      { topic: "a", envelope: envelope({ key: "k2" }) },
+      { topic: "b", envelope: envelope({ key: "k3" }) },
     ]);
 
-    expect(handler).toHaveBeenCalledTimes(2);
-    expect(result.processed).toBe(1);
-    expect(result.retried).toBe(1);
+    expect(records).toHaveLength(2);
+    expect(records[0].messages).toHaveLength(2);
+    expect(records[0].messages[0].headers["event-type"]).toBe("session.booked");
+    expect(records[0].messages[0].headers["event-version"]).toBe("1");
+  });
+});
+
+describe("KafkaProducerService", () => {
+  it("connects once and sends the batch", async () => {
+    const driver = new RecordingDriver();
+    const producer = new KafkaProducerService({ driver, sleep: noSleep });
+
+    await producer.publish({
+      topic: "sessions",
+      key: "m1",
+      eventType: "x",
+      payload: {},
+    });
+    await producer.publish({
+      topic: "sessions",
+      key: "m2",
+      eventType: "x",
+      payload: {},
+    });
+
+    expect(driver.connects).toBe(1);
+    expect(driver.sent).toHaveLength(2);
   });
 
-  it('dead-letters a poison message instead of blocking the partition', async () => {
-    const dead: unknown[] = [];
-    const handler = jest.fn().mockRejectedValue(new Error('always fails'));
+  it("retries and then succeeds", async () => {
+    const driver = new RecordingDriver();
+    driver.failuresRemaining = 2;
+    const producer = new KafkaProducerService({ driver, sleep: noSleep });
 
-    const result = await new StreamProcessor({
-      handler,
+    await producer.publish({
+      topic: "sessions",
+      key: "m1",
+      eventType: "x",
+      payload: {},
+    });
+
+    expect(driver.sent).toHaveLength(1);
+  });
+
+  it("dead-letters and rethrows once attempts are exhausted", async () => {
+    const driver = new RecordingDriver();
+    driver.failuresRemaining = 99;
+    const dead: OutboundMessage[] = [];
+    const producer = new KafkaProducerService({
+      driver,
+      sleep: noSleep,
       maxAttempts: 2,
-      onDeadLetter: (m) => {
-        dead.push(m);
+      onDeadLetter: (message) => {
+        dead.push(message);
       },
-    }).processBatch([msg()]);
+    });
 
-    expect(handler).toHaveBeenCalledTimes(2);
-    expect(result.deadLettered).toBe(1);
+    await expect(
+      producer.publish({
+        topic: "sessions",
+        key: "m1",
+        eventType: "x",
+        payload: {},
+      }),
+    ).rejects.toThrow("broker unavailable");
     expect(dead).toHaveLength(1);
   });
 
-  it('keeps processing after a dead-letter', async () => {
-    const handler = jest
-      .fn()
-      .mockRejectedValueOnce(new Error('bad'))
-      .mockRejectedValueOnce(new Error('bad'))
-      .mockResolvedValue(undefined);
+  it("is a no-op for an empty batch", async () => {
+    const driver = new RecordingDriver();
+    const producer = new KafkaProducerService({ driver, sleep: noSleep });
 
-    const result = await new StreamProcessor({
-      handler,
-      maxAttempts: 2,
-      onDeadLetter: () => undefined,
-    }).processBatch([msg({ key: 'a' }), msg({ key: 'b' })]);
-
-    // One lost message beats a stalled consumer group.
-    expect(result.deadLettered).toBe(1);
-    expect(result.processed).toBe(1);
-  });
-
-  it('reports errors with the attempt number', async () => {
-    const attempts: number[] = [];
-    await new StreamProcessor({
-      handler: jest.fn().mockRejectedValue(new Error('x')),
-      maxAttempts: 3,
-      onError: (_m, _e, attempt) => attempts.push(attempt),
-    }).processBatch([msg()]);
-
-    expect(attempts).toEqual([1, 2, 3]);
-  });
-
-  it('preserves order within a batch', async () => {
-    const seen: string[] = [];
-    await new StreamProcessor<string>({
-      handler: async (m) => {
-        seen.push(m.value);
-      },
-    }).processBatch([
-      msg<string>({ value: 'first' }),
-      msg<string>({ value: 'second' }),
-    ]);
-
-    expect(seen).toEqual(['first', 'second']);
+    expect(await producer.publishBatch([])).toEqual([]);
+    expect(driver.connects).toBe(0);
   });
 });
 
-// ─── Event sourcing ───────────────────────────────────────────────────────────
+// ─── Consumer ────────────────────────────────────────────────────────────────
 
-interface ProfileState {
-  name: string;
-  updates: number;
+describe("parseEnvelope", () => {
+  it("rejects invalid JSON, a null value and an envelope without an eventId", () => {
+    expect(parseEnvelope(consumed({ value: "not json" }))).toBeNull();
+    expect(parseEnvelope(consumed({ value: null }))).toBeNull();
+    expect(parseEnvelope(consumed({ value: '{"eventType":"x"}' }))).toBeNull();
+  });
+
+  it("accepts a well-formed envelope", () => {
+    expect(parseEnvelope(consumed())?.eventType).toBe("session.booked");
+  });
+});
+
+describe("deadLetterTopicFor", () => {
+  it("suffixes the source topic", () => {
+    expect(deadLetterTopicFor("sessions")).toBe("sessions.dlq");
+  });
+});
+
+describe("KafkaConsumerService", () => {
+  it("dispatches to every handler for the topic", async () => {
+    const consumer = new KafkaConsumerService({ groupId: "g", sleep: noSleep });
+    const seen: string[] = [];
+    consumer.on("sessions", () => {
+      seen.push("a");
+    });
+    consumer.on("sessions", () => {
+      seen.push("b");
+    });
+
+    await consumer.handle(consumed());
+
+    expect(seen).toEqual(["a", "b"]);
+    expect(consumer.getStats().processed).toBe(1);
+  });
+
+  it("ignores a topic with no handlers", async () => {
+    const consumer = new KafkaConsumerService({ groupId: "g", sleep: noSleep });
+    await consumer.handle(consumed({ topic: "other" }));
+    expect(consumer.getStats()).toMatchObject({ processed: 0, failed: 0 });
+  });
+
+  it("retries a failing handler then dead-letters without throwing", async () => {
+    const dead: Array<{ attempts: number; reason: string }> = [];
+    const consumer = new KafkaConsumerService({
+      groupId: "g",
+      sleep: noSleep,
+      maxAttempts: 3,
+      deadLetter: {
+        async send(_message, error, attempts) {
+          dead.push({ attempts, reason: error.message });
+        },
+      },
+    });
+    consumer.on("sessions", () => {
+      throw new Error("projection down");
+    });
+
+    await expect(consumer.handle(consumed())).resolves.toBeUndefined();
+
+    expect(consumer.getStats().failed).toBe(3);
+    expect(dead).toEqual([{ attempts: 3, reason: "projection down" }]);
+  });
+
+  it("succeeds on a retry without dead-lettering", async () => {
+    let attempts = 0;
+    const consumer = new KafkaConsumerService({ groupId: "g", sleep: noSleep });
+    consumer.on("sessions", () => {
+      if (++attempts < 2) throw new Error("transient");
+    });
+
+    await consumer.handle(consumed());
+
+    expect(consumer.getStats()).toMatchObject({
+      processed: 1,
+      deadLettered: 0,
+    });
+  });
+
+  it("dead-letters an unparseable message instead of retrying it", async () => {
+    let sent = 0;
+    const consumer = new KafkaConsumerService({
+      groupId: "g",
+      sleep: noSleep,
+      deadLetter: {
+        async send() {
+          sent++;
+        },
+      },
+    });
+    const handler = jest.fn();
+    consumer.on("sessions", handler);
+
+    await consumer.handle(consumed({ value: "garbage" }));
+
+    expect(handler).not.toHaveBeenCalled();
+    expect(sent).toBe(1);
+    expect(consumer.getStats().skippedUnparseable).toBe(1);
+  });
+});
+
+// ─── Stream processor ────────────────────────────────────────────────────────
+
+describe("windowStartFor", () => {
+  it("floors an event time to its window", () => {
+    expect(windowStartFor(1_005, 1_000)).toBe(1_000);
+    expect(windowStartFor(2_000, 1_000)).toBe(2_000);
+  });
+});
+
+describe("StreamProcessorService", () => {
+  function at(
+    ms: number,
+    overrides: Partial<EventEnvelope> = {},
+  ): EventEnvelope {
+    return envelope({ occurredAt: new Date(ms).toISOString(), ...overrides });
+  }
+
+  it("emits a window once the watermark passes it", async () => {
+    const emitted: WindowedResult[] = [];
+    const processor = new StreamProcessorService().window({
+      name: "bookings",
+      sizeMs: 1_000,
+      allowedLatenessMs: 0,
+      aggregator: countAggregator,
+      sink: (result) => {
+        emitted.push(result);
+      },
+    });
+
+    await processor.process(at(0));
+    await processor.process(at(500));
+    expect(emitted).toHaveLength(0); // window still open
+
+    await processor.process(at(1_500));
+
+    expect(emitted).toHaveLength(1);
+    expect(emitted[0]).toMatchObject({
+      windowStart: 0,
+      windowEnd: 1_000,
+      count: 2,
+      value: 2,
+    });
+  });
+
+  it("keeps separate windows per key", async () => {
+    const emitted: WindowedResult[] = [];
+    const processor = new StreamProcessorService().window({
+      name: "bookings",
+      sizeMs: 1_000,
+      allowedLatenessMs: 0,
+      keyBy: (event) => event.key,
+      aggregator: countAggregator,
+      sink: (result) => {
+        emitted.push(result);
+      },
+    });
+
+    await processor.process(at(0, { key: "mentor-a" }));
+    await processor.process(at(0, { key: "mentor-b" }));
+    await processor.process(at(0, { key: "mentor-a" }));
+    await processor.flush();
+
+    const byKey = Object.fromEntries(emitted.map((r) => [r.key, r.count]));
+    expect(byKey).toEqual({ "mentor-a": 2, "mentor-b": 1 });
+  });
+
+  it("drops an event that arrives after its window closed", async () => {
+    const emitted: WindowedResult[] = [];
+    const processor = new StreamProcessorService().window({
+      name: "bookings",
+      sizeMs: 1_000,
+      allowedLatenessMs: 0,
+      aggregator: countAggregator,
+      sink: (result) => {
+        emitted.push(result);
+      },
+    });
+
+    await processor.process(at(0));
+    await processor.process(at(5_000)); // closes window 0
+    await processor.process(at(100)); // far too late
+
+    expect(processor.getStats().late).toBe(1);
+    expect(emitted[0].count).toBe(1);
+  });
+
+  it("drops filtered events before they reach a window", async () => {
+    const processor = new StreamProcessorService()
+      .filter((event) => event.eventType === "session.booked")
+      .window({
+        name: "bookings",
+        sizeMs: 1_000,
+        aggregator: countAggregator,
+        sink: () => {},
+      });
+
+    await processor.process(at(0, { eventType: "session.cancelled" }));
+
+    expect(processor.getStats()).toMatchObject({ consumed: 1, filtered: 1 });
+  });
+
+  it("flushes open windows on shutdown", async () => {
+    const emitted: WindowedResult[] = [];
+    const processor = new StreamProcessorService().window({
+      name: "bookings",
+      sizeMs: 60_000,
+      aggregator: countAggregator,
+      sink: (result) => {
+        emitted.push(result);
+      },
+    });
+
+    await processor.process(at(0));
+    expect(emitted).toHaveLength(0);
+
+    await processor.flush();
+    expect(emitted).toHaveLength(1);
+  });
+
+  it("does not let a failing sink stall the stream", async () => {
+    const processor = new StreamProcessorService().window({
+      name: "bookings",
+      sizeMs: 1_000,
+      allowedLatenessMs: 0,
+      aggregator: countAggregator,
+      sink: () => {
+        throw new Error("dashboard down");
+      },
+    });
+
+    await processor.process(at(0));
+    await expect(processor.process(at(5_000))).resolves.toBeUndefined();
+    expect(processor.getStats().windowsEmitted).toBe(0);
+  });
+
+  it("sums and counts distinct payload fields", async () => {
+    const sums: WindowedResult[] = [];
+    const distincts: WindowedResult[] = [];
+    const processor = new StreamProcessorService()
+      .window({
+        name: "revenue",
+        sizeMs: 1_000,
+        aggregator: sumAggregator("amount"),
+        sink: (r) => {
+          sums.push(r);
+        },
+      })
+      .window({
+        name: "mentees",
+        sizeMs: 1_000,
+        aggregator: distinctAggregator("menteeId"),
+        sink: (r) => {
+          distincts.push(r);
+        },
+      });
+
+    await processor.process(at(0, { payload: { amount: 10, menteeId: "a" } }));
+    await processor.process(at(10, { payload: { amount: 5, menteeId: "a" } }));
+    await processor.process(at(20, { payload: { menteeId: "b" } }));
+    await processor.flush();
+
+    expect(sums[0].value).toBe(15);
+    expect(distincts[0].value).toBe(2);
+  });
+});
+
+// ─── Event sourcing / CQRS ───────────────────────────────────────────────────
+
+interface BookingState {
+  status: "none" | "booked" | "cancelled";
 }
+type BookingCommand = { type: "book" } | { type: "cancel" };
 
-const profileProjection: Projection<ProfileState> = {
-  name: 'profile',
-  initial: () => ({ name: '', updates: 0 }),
+const bookingAggregate: Aggregate<BookingState, BookingCommand> = {
+  type: "booking",
+  initial: () => ({ status: "none" }),
   apply: (state, event) => {
-    if (event.type === 'ProfileUpdated') {
-      return {
-        name: (event.payload as { name: string }).name,
-        updates: state.updates + 1,
-      };
-    }
+    if (event.eventType === "booking.created") return { status: "booked" };
+    if (event.eventType === "booking.cancelled") return { status: "cancelled" };
     return state;
+  },
+  decide: (state, command) => {
+    if (command.type === "book") {
+      return state.status === "booked"
+        ? []
+        : [{ eventType: "booking.created", data: {} }];
+    }
+    return state.status === "booked"
+      ? [{ eventType: "booking.cancelled", data: {} }]
+      : [];
   },
 };
 
-describe('EventSourcingService', () => {
-  let store: InMemoryEventStore;
-  let service: EventSourcingService;
+describe("EventSourcingService", () => {
+  it("appends the decided events and returns the new state", async () => {
+    const journal = new InMemoryEventJournal();
+    const service = new EventSourcingService({ journal });
 
-  beforeEach(() => {
-    store = new InMemoryEventStore();
-    service = new EventSourcingService(store);
+    const result = await service.execute(bookingAggregate, "b1", {
+      type: "book",
+    });
+
+    expect(result.events.map((e) => e.eventType)).toEqual(["booking.created"]);
+    expect(result.state.status).toBe("booked");
+    expect(result.version).toBe(1);
   });
 
-  const event = (name: string, at = 1_000) => ({
-    type: 'ProfileUpdated',
-    payload: { name },
-    occurredAt: at,
+  it("treats a command that changes nothing as a no-op", async () => {
+    const journal = new InMemoryEventJournal();
+    const service = new EventSourcingService({ journal });
+    await service.execute(bookingAggregate, "b1", { type: "book" });
+
+    const second = await service.execute(bookingAggregate, "b1", {
+      type: "book",
+    });
+
+    expect(second.events).toEqual([]);
+    expect(second.version).toBe(1);
   });
 
-  it('numbers appended events from one', async () => {
-    const result = await service.append('mentor-1', [event('a'), event('b')]);
-    expect(result.version).toBe(2);
-    expect(result.appended).toBe(2);
-  });
+  it("rehydrates state from the stream", async () => {
+    const journal = new InMemoryEventJournal();
+    const service = new EventSourcingService({ journal });
+    await service.execute(bookingAggregate, "b1", { type: "book" });
+    await service.execute(bookingAggregate, "b1", { type: "cancel" });
 
-  it('continues numbering across appends', async () => {
-    await service.append('mentor-1', [event('a')]);
-    const second = await service.append('mentor-1', [event('b')]);
-    expect(second.version).toBe(2);
-  });
-
-  it('is a no-op for an empty append', async () => {
-    const result = await service.append('mentor-1', []);
-    expect(result.appended).toBe(0);
-  });
-
-  it('rejects an append on a stale version', async () => {
-    await service.append('mentor-1', [event('a')]);
-    // A lost update must be loud, not silently interleaved.
-    await expect(service.append('mentor-1', [event('b')], 0)).rejects.toThrow(
-      ConcurrencyError,
-    );
-  });
-
-  it('accepts an append on the expected version', async () => {
-    await service.append('mentor-1', [event('a')]);
-    await expect(service.append('mentor-1', [event('b')], 1)).resolves.toMatchObject({
+    expect(await service.rehydrate(bookingAggregate, "b1")).toEqual({
+      state: { status: "cancelled" },
       version: 2,
     });
   });
 
-  it('appends unconditionally with version -1', async () => {
-    await service.append('mentor-1', [event('a')]);
-    await expect(service.append('mentor-1', [event('b')], -1)).resolves.toBeDefined();
+  it("rejects a stale append rather than losing a write", async () => {
+    const journal = new InMemoryEventJournal();
+    await journal.append(
+      "b1",
+      "booking",
+      0,
+      [{ eventType: "booking.created", data: {} }],
+      "c",
+    );
+
+    await expect(
+      journal.append(
+        "b1",
+        "booking",
+        0,
+        [{ eventType: "booking.cancelled", data: {} }],
+        "c",
+      ),
+    ).rejects.toBeInstanceOf(ConcurrencyError);
   });
 
-  it('rebuilds state by folding the stream', async () => {
-    await service.append('mentor-1', [event('first'), event('second')]);
-    const projected = await service.project('mentor-1', profileProjection);
+  it("runs only the projections that match the event type", async () => {
+    const journal = new InMemoryEventJournal();
+    const service = new EventSourcingService({ journal });
+    const seen: string[] = [];
 
-    expect(projected.state).toEqual({ name: 'second', updates: 2 });
-    expect(projected.version).toBe(2);
-  });
+    service.registerProjection({
+      name: "created-only",
+      eventTypes: ["booking.created"],
+      handle: (e) => {
+        seen.push(`created:${e.version}`);
+      },
+    });
+    service.registerProjection({
+      name: "all",
+      eventTypes: [],
+      handle: (e) => {
+        seen.push(`all:${e.eventType}`);
+      },
+    });
 
-  it('leaves state unchanged for an unknown event type', async () => {
-    await service.append('mentor-1', [
-      { type: 'SomethingNew', payload: {}, occurredAt: 1 },
+    await service.execute(bookingAggregate, "b1", { type: "book" });
+    await service.execute(bookingAggregate, "b1", { type: "cancel" });
+
+    expect(seen).toEqual([
+      "created:1",
+      "all:booking.created",
+      "all:booking.cancelled",
     ]);
-    const projected = await service.project('mentor-1', profileProjection);
-
-    // Adding an event type must not break existing projections on replay.
-    expect(projected.state.updates).toBe(0);
   });
 
-  it('catches a projection up incrementally', async () => {
-    await service.append('mentor-1', [event('first')]);
-    const first = await service.project('mentor-1', profileProjection);
+  it("does not fail a command when a projection throws", async () => {
+    const journal = new InMemoryEventJournal();
+    const service = new EventSourcingService({ journal });
+    service.registerProjection({
+      name: "broken",
+      eventTypes: [],
+      handle: () => {
+        throw new Error("read model down");
+      },
+    });
 
-    await service.append('mentor-1', [event('second')]);
-    const caughtUp = await service.projectFrom('mentor-1', profileProjection, first);
-
-    expect(caughtUp.state.updates).toBe(2);
-    expect(caughtUp.version).toBe(2);
-  });
-
-  it('returns the previous state when there is nothing new', async () => {
-    await service.append('mentor-1', [event('a')]);
-    const first = await service.project('mentor-1', profileProjection);
-
-    expect(await service.projectFrom('mentor-1', profileProjection, first)).toBe(first);
-  });
-
-  it('projects state as of a point in time', async () => {
-    await service.append('mentor-1', [event('early', 1_000), event('late', 5_000)]);
-
-    const asOf = await service.projectAsOf('mentor-1', profileProjection, 2_000);
-    // The audit question event sourcing exists to answer.
-    expect(asOf.state.name).toBe('early');
-  });
-
-  it('folds defensively when the store returns events out of order', () => {
-    const events: DomainEvent[] = [
-      { streamId: 's', type: 'ProfileUpdated', version: 2, payload: { name: 'b' }, occurredAt: 2 },
-      { streamId: 's', type: 'ProfileUpdated', version: 1, payload: { name: 'a' }, occurredAt: 1 },
-    ];
-
-    expect(service.foldEvents(events, profileProjection).state.name).toBe('b');
-  });
-
-  it('reports an empty stream as version zero', async () => {
-    expect(await service.currentVersion('nothing')).toBe(0);
-  });
-});
-
-describe('CommandBus', () => {
-  it('dispatches to a registered handler', async () => {
-    const bus = new CommandBus();
-    bus.register('UpdateProfile', async () => ({
-      streamId: 'mentor-1',
-      version: 1,
-      events: 1,
-    }));
-
-    await expect(bus.dispatch('UpdateProfile', {})).resolves.toMatchObject({
+    await expect(
+      service.execute(bookingAggregate, "b1", { type: "book" }),
+    ).resolves.toMatchObject({
       version: 1,
     });
   });
 
-  it('throws for an unregistered command', async () => {
-    await expect(new CommandBus().dispatch('Unknown', {})).rejects.toThrow(/No handler/);
-  });
-
-  it('lists registered commands', () => {
-    const bus = new CommandBus();
-    bus.register('A', async () => ({ streamId: 's', version: 1, events: 1 }));
-    expect(bus.registeredCommands()).toEqual(['A']);
-  });
-});
-
-// ─── Kafka adapters ───────────────────────────────────────────────────────────
-
-describe('serialiseValue', () => {
-  it('serialises a plain object', () => {
-    expect(serialiseValue({ a: 1 })).toBe('{"a":1}');
-  });
-
-  it('allows null as an empty payload', () => {
-    expect(serialiseValue(null)).toBe('null');
-  });
-
-  it('rejects undefined', () => {
-    // Would otherwise ship `undefined` into the topic as a poison message.
-    expect(() => serialiseValue(undefined)).toThrow(/undefined/);
-  });
-
-  it('rejects a circular structure', () => {
-    const circular: Record<string, unknown> = {};
-    circular.self = circular;
-    expect(() => serialiseValue(circular)).toThrow(/not serialisable/);
-  });
-});
-
-class FakeProducerClient implements ProducerClient {
-  sent: Array<{ topic: string; records: ProducerRecord[] }> = [];
-  failTimes = 0;
-
-  async send(topic: string, records: ProducerRecord[]): Promise<void> {
-    if (this.failTimes > 0) {
-      this.failTimes -= 1;
-      throw new Error('broker unavailable');
-    }
-    this.sent.push({ topic, records });
-  }
-}
-
-describe('KafkaProducerService', () => {
-  let client: FakeProducerClient;
-
-  beforeEach(() => {
-    client = new FakeProducerClient();
-  });
-
-  it('buffers until the batch fills', async () => {
-    const producer = new KafkaProducerService({ client, batchSize: 3 });
-
-    await producer.publish(msg());
-    await producer.publish(msg());
-    expect(client.sent).toHaveLength(0);
-    expect(producer.pendingCount()).toBe(2);
-
-    await producer.publish(msg());
-    expect(client.sent).toHaveLength(1);
-  });
-
-  it('flushes remaining messages on demand', async () => {
-    const producer = new KafkaProducerService({ client, batchSize: 100 });
-    await producer.publish(msg());
-    await producer.flush();
-
-    expect(client.sent).toHaveLength(1);
-    expect(producer.pendingCount()).toBe(0);
-  });
-
-  it('preserves the partition key', async () => {
-    const producer = new KafkaProducerService({ client, batchSize: 1 });
-    await producer.publish(msg({ key: 'mentor-42' }));
-
-    // A null key would scatter an entity's events across partitions.
-    expect(client.sent[0].records[0].key).toBe('mentor-42');
-  });
-
-  it('retries a failed send', async () => {
-    client.failTimes = 1;
-    const producer = new KafkaProducerService({ client, batchSize: 1, maxRetries: 3 });
-
-    await producer.publish(msg());
-    expect(client.sent).toHaveLength(1);
-    expect(producer.getStats().retries).toBe(1);
-  });
-
-  it('throws after exhausting retries', async () => {
-    client.failTimes = 99;
-    const producer = new KafkaProducerService({ client, batchSize: 100, maxRetries: 2 });
-
-    await producer.publish(msg());
-    await expect(producer.flush()).rejects.toThrow(/broker unavailable/);
-    expect(producer.getStats().failed).toBe(1);
-  });
-
-  it('flushes on disconnect so nothing is lost', async () => {
-    const producer = new KafkaProducerService({ client, batchSize: 100 });
-    await producer.publish(msg());
-    await producer.disconnect();
-
-    expect(client.sent).toHaveLength(1);
-  });
-});
-
-describe('toStreamMessage', () => {
-  const record = (over: Partial<ConsumerRecord> = {}): ConsumerRecord => ({
-    topic: 't',
-    partition: 0,
-    offset: '10',
-    key: 'k',
-    value: '{"a":1}',
-    timestamp: '1000',
-    ...over,
-  });
-
-  it('parses a JSON record', () => {
-    const message = toStreamMessage(record());
-    expect(message?.value).toEqual({ a: 1 });
-    expect(message?.offset).toBe(10);
-  });
-
-  it('returns null for a tombstone', () => {
-    expect(toStreamMessage(record({ value: null }))).toBeNull();
-  });
-
-  it('returns null for an unparseable payload', () => {
-    // Throwing would stall the partition on one bad record.
-    expect(toStreamMessage(record({ value: 'not json' }))).toBeNull();
-  });
-
-  it('falls back to arrival time for a bad broker timestamp', () => {
-    const message = toStreamMessage(record({ timestamp: 'nonsense' }));
-    // A bad header must not push the message into 1970 and break windowing.
-    expect(message!.timestamp).toBeGreaterThan(0);
-  });
-});
-
-class FakeConsumerClient implements ConsumerClient {
-  commits: Array<{ topic: string; partition: number; offset: string }> = [];
-  subscribed: string[] = [];
-
-  async subscribe(topics: string[]): Promise<void> {
-    this.subscribed = topics;
-  }
-
-  async run(): Promise<void> {
-    /* driven directly via handleBatch in tests */
-  }
-
-  async commit(topic: string, partition: number, offset: string): Promise<void> {
-    this.commits.push({ topic, partition, offset });
-  }
-}
-
-describe('KafkaConsumerService', () => {
-  const record = (over: Partial<ConsumerRecord> = {}): ConsumerRecord => ({
-    topic: 't',
-    partition: 0,
-    offset: '1',
-    key: 'k',
-    value: '{"n":1}',
-    timestamp: '1000',
-    ...over,
-  });
-
-  it('processes a batch and commits once', async () => {
-    const client = new FakeConsumerClient();
-    const handler = jest.fn().mockResolvedValue(undefined);
-    const consumer = new KafkaConsumerService({
-      client,
-      topics: ['t'],
-      handler,
-      commitPolicy: 'after-batch',
+  it("publishes durable events to Kafka", async () => {
+    const journal = new InMemoryEventJournal();
+    const driver = new RecordingDriver();
+    const service = new EventSourcingService({
+      journal,
+      producer: new KafkaProducerService({ driver, sleep: noSleep }),
+      topic: "bookings",
     });
 
-    await consumer.handleBatch([record({ offset: '1' }), record({ offset: '2' })]);
+    await service.execute(bookingAggregate, "b1", { type: "book" });
 
-    expect(handler).toHaveBeenCalledTimes(2);
-    expect(client.commits).toHaveLength(1);
-    expect(client.commits[0].offset).toBe('2');
+    expect(driver.sent[0].topic).toBe("bookings");
+    expect(driver.sent[0].messages[0].key).toBe("b1");
   });
 
-  it('commits per message when configured', async () => {
-    const client = new FakeConsumerClient();
-    const consumer = new KafkaConsumerService({
-      client,
-      topics: ['t'],
-      handler: jest.fn().mockResolvedValue(undefined),
-      commitPolicy: 'per-message',
+  it("keeps the events when publishing fails", async () => {
+    const journal = new InMemoryEventJournal();
+    const driver = new RecordingDriver();
+    driver.failuresRemaining = 99;
+    const service = new EventSourcingService({
+      journal,
+      producer: new KafkaProducerService({
+        driver,
+        sleep: noSleep,
+        maxAttempts: 1,
+      }),
+      topic: "bookings",
     });
 
-    await consumer.handleBatch([record({ offset: '1' }), record({ offset: '2' })]);
-    expect(client.commits).toHaveLength(2);
+    await expect(
+      service.execute(bookingAggregate, "b1", { type: "book" }),
+    ).resolves.toMatchObject({
+      version: 1,
+    });
+    expect(await journal.read("b1")).toHaveLength(1);
   });
 
-  it('does not commit under a manual policy', async () => {
-    const client = new FakeConsumerClient();
-    const consumer = new KafkaConsumerService({
-      client,
-      topics: ['t'],
-      handler: jest.fn().mockResolvedValue(undefined),
-      commitPolicy: 'manual',
+  it("replays a stream through the projections to rebuild a read model", async () => {
+    const journal = new InMemoryEventJournal();
+    const service = new EventSourcingService({ journal });
+    await service.execute(bookingAggregate, "b1", { type: "book" });
+    await service.execute(bookingAggregate, "b1", { type: "cancel" });
+
+    const replayed: StoredEvent[] = [];
+    service.registerProjection({
+      name: "rebuild",
+      eventTypes: [],
+      handle: (e) => {
+        replayed.push(e);
+      },
     });
 
-    await consumer.handleBatch([record()]);
-    expect(client.commits).toHaveLength(0);
-  });
-
-  it('skips an unparseable record without retrying it', async () => {
-    const client = new FakeConsumerClient();
-    const handler = jest.fn().mockResolvedValue(undefined);
-    const consumer = new KafkaConsumerService({ client, topics: ['t'], handler });
-
-    await consumer.handleBatch([record({ value: 'garbage' }), record()]);
-
-    // A corrupt payload is just as corrupt on the third attempt.
-    expect(handler).toHaveBeenCalledTimes(1);
-    expect(consumer.getStats().skipped).toBe(1);
-  });
-
-  it('advances past a dead-lettered message under per-message commits', async () => {
-    const client = new FakeConsumerClient();
-    const consumer = new KafkaConsumerService({
-      client,
-      topics: ['t'],
-      handler: jest.fn().mockRejectedValue(new Error('poison')),
-      commitPolicy: 'per-message',
-      maxAttempts: 1,
-      onDeadLetter: () => undefined,
-    });
-
-    await consumer.handleBatch([record()]);
-
-    // Replaying it would dead-letter it forever and never advance the offset.
-    expect(consumer.getStats().deadLettered).toBe(1);
-    expect(client.commits).toHaveLength(1);
-  });
-
-  it('subscribes to its topics on start', async () => {
-    const client = new FakeConsumerClient();
-    const consumer = new KafkaConsumerService({
-      client,
-      topics: ['a', 'b'],
-      handler: jest.fn(),
-    });
-
-    await consumer.start();
-    expect(client.subscribed).toEqual(['a', 'b']);
+    expect(await service.replay("b1")).toBe(2);
+    expect(replayed.map((e) => e.eventType)).toEqual([
+      "booking.created",
+      "booking.cancelled",
+    ]);
   });
 });

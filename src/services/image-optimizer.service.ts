@@ -1,243 +1,223 @@
 /**
- * Image optimisation and format negotiation (issue #863).
+ * Image optimization and delivery (issue #863).
  *
- * `cdn.service.ts` already knows how to re-encode a buffer with sharp. What was
- * missing is the decision layer around it: *which* format to serve to *this*
- * client, and which variants are worth generating at all.
+ * Wraps the sharp helpers in `utils/image.utils` with the delivery concerns:
+ * format negotiation against the caller's Accept header, a responsive variant
+ * set with a matching srcset, a blurred placeholder, and a content-addressed
+ * key so a variant is cached forever at the edge and never invalidated.
  *
- * Those decisions are pure functions here, separate from any pixel work, so
- * the negotiation and planning logic is unit-testable without sharp, a network
- * or an image. Getting them wrong is silent — a browser that cannot decode
- * AVIF gets a broken image, and nobody sees it in a test that only checks
- * "did sharp run".
+ * Sharp is required lazily: it is a native module, and a unit test for the
+ * naming and negotiation logic should not have to load it.
  */
 
-export type ImageFormat = 'avif' | 'webp' | 'jpeg' | 'png';
+import crypto from "crypto";
+import { Logger } from "../utils/logger";
+import {
+  cdnConfig,
+  negotiateImageFormat,
+  type CDNConfiguration,
+  type ImageDeliveryFormat,
+  type ImageNegotiationConfig,
+} from "../config/cdn.config";
+import type { ProcessedImage } from "../utils/image.utils";
 
-export interface NegotiationResult {
-  format: ImageFormat;
-  /** Why this format was chosen — surfaced in logs and `Vary` debugging. */
-  reason: string;
+const logger = new Logger("ImageOptimizer");
+
+export interface OptimizedVariant {
+  width: number;
+  format: ImageDeliveryFormat;
+  /** Content-addressed path, safe to cache immutably. */
+  key: string;
+  bytes: number;
+}
+
+export interface OptimizationResult {
+  variants: OptimizedVariant[];
+  /** `srcset` value covering every variant. */
+  srcset: string;
+  format: ImageDeliveryFormat;
+  /** Inline data URI placeholder, when enabled. */
+  placeholder?: string;
+  /** Bytes saved against the source, summed over the smallest variant. */
+  savedBytes: number;
+}
+
+export class ImageTooLargeError extends Error {
+  constructor(bytes: number, limit: number) {
+    super(`image is ${bytes} bytes, limit is ${limit}`);
+    this.name = "ImageTooLargeError";
+  }
+}
+
+/** Formats sharp can encode. `negotiateImageFormat` may return any of these. */
+const ENCODABLE: ReadonlySet<ImageDeliveryFormat> = new Set([
+  "avif",
+  "webp",
+  "jpeg",
+  "png",
+]);
+
+/**
+ * Content-addressed variant key.
+ *
+ * The hash covers the source bytes plus the variant parameters, so two requests
+ * for the same rendition share a key and a changed source never collides with
+ * the old one. That is what makes an immutable, never-purged edge cache safe.
+ */
+export function variantKey(
+  sourceDigest: string,
+  width: number,
+  format: ImageDeliveryFormat,
+  quality: number,
+): string {
+  const suffix = crypto
+    .createHash("sha256")
+    .update(`${sourceDigest}:${width}:${format}:${quality}`)
+    .digest("hex")
+    .slice(0, 16);
+  return `img/${sourceDigest.slice(0, 8)}/${width}w-${suffix}.${format}`;
+}
+
+export function digestOf(buffer: Buffer): string {
+  return crypto.createHash("sha256").update(buffer).digest("hex");
 }
 
 /**
- * Preference order when a client supports several.
+ * Widths to generate for a source image.
  *
- * AVIF first: typically 20–30% smaller than WebP at equivalent quality. WebP
- * next, then JPEG as the universal fallback.
+ * Breakpoints wider than the source are dropped — upscaling produces a larger
+ * file that looks worse. The source width is always included so there is a
+ * variant at full fidelity.
  */
-const PREFERENCE: ImageFormat[] = ['avif', 'webp', 'jpeg'];
+export function widthsFor(
+  sourceWidth: number,
+  breakpoints: number[],
+): number[] {
+  const usable = breakpoints.filter((width) => width < sourceWidth);
+  return [...new Set([...usable, sourceWidth])].sort((a, b) => a - b);
+}
 
-const ACCEPT_TOKENS: Record<string, ImageFormat> = {
-  'image/avif': 'avif',
-  'image/webp': 'webp',
-  'image/jpeg': 'jpeg',
-  'image/png': 'png',
+export function buildSrcset(
+  variants: OptimizedVariant[],
+  baseUrl: string,
+): string {
+  return variants
+    .map((variant) => `${joinUrl(baseUrl, variant.key)} ${variant.width}w`)
+    .join(", ");
+}
+
+export function joinUrl(base: string, path: string): string {
+  return `${base.replace(/\/+$/, "")}/${path.replace(/^\/+/, "")}`;
+}
+
+export interface ImageProcessor {
+  process(
+    buffer: Buffer,
+    options: { width?: number },
+    format: ImageDeliveryFormat,
+    quality: number,
+  ): Promise<ProcessedImage>;
+  lqip(buffer: Buffer): Promise<string>;
+  metadata(buffer: Buffer): Promise<{ width: number; height: number }>;
+}
+
+/** Default processor, backed by sharp via the existing image utilities. */
+const sharpProcessor: ImageProcessor = {
+  async process(buffer, options, format, quality) {
+    const { processImage } = require("../utils/image.utils");
+    return processImage(buffer, options, format, quality);
+  },
+  async lqip(buffer) {
+    const { createLQIP } = require("../utils/image.utils");
+    return createLQIP(buffer);
+  },
+  async metadata(buffer) {
+    const sharp = require("sharp");
+    const meta = await sharp(buffer).metadata();
+    return { width: meta.width ?? 0, height: meta.height ?? 0 };
+  },
 };
 
-/**
- * Parse an `Accept` header into the formats a client will take.
- *
- * `image/*` is treated as "modern formats are fine" — a client claiming a
- * wildcard is asserting it can decode whatever the server picks, and every
- * browser that sends a bare `image/*` today handles WebP.
- *
- * A `q=0` entry is an explicit refusal and is honoured; a malformed q value is
- * ignored rather than treated as a refusal, since dropping a format because of
- * a typo'd header degrades quality for no reason.
- */
-export function parseAcceptHeader(header: string | undefined | null): Set<ImageFormat> {
-  const accepted = new Set<ImageFormat>();
-  if (!header) return accepted;
+export class ImageOptimizerService {
+  constructor(
+    private readonly config: CDNConfiguration = cdnConfig,
+    private readonly processor: ImageProcessor = sharpProcessor,
+  ) {}
 
-  for (const rawPart of header.split(',')) {
-    const part = rawPart.trim().toLowerCase();
-    if (!part) continue;
-
-    const [type, ...params] = part.split(';').map((p) => p.trim());
-
-    // Honour an explicit q=0 refusal.
-    const qParam = params.find((p) => p.startsWith('q='));
-    if (qParam) {
-      const q = Number(qParam.slice(2));
-      if (Number.isFinite(q) && q === 0) continue;
-    }
-
-    if (type === '*/*' || type === 'image/*') {
-      accepted.add('webp');
-      accepted.add('jpeg');
-      accepted.add('png');
-      continue;
-    }
-
-    const format = ACCEPT_TOKENS[type];
-    if (format) accepted.add(format);
+  /** Best format for a caller's `Accept` header. */
+  formatFor(acceptHeader: string | undefined): ImageDeliveryFormat {
+    const format = negotiateImageFormat(acceptHeader, this.config.images);
+    return ENCODABLE.has(format) ? format : "jpeg";
   }
 
-  return accepted;
-}
+  /**
+   * Produce every responsive variant of an image, plus a srcset and placeholder.
+   *
+   * @param source     Original image bytes.
+   * @param baseUrl    Public CDN base the srcset URLs are built from.
+   * @param accept     Caller's `Accept` header, used to pick the format.
+   */
+  async optimize(
+    source: Buffer,
+    baseUrl: string,
+    accept?: string,
+    overrides: Partial<ImageNegotiationConfig> = {},
+  ): Promise<OptimizationResult> {
+    const settings = { ...this.config.images, ...overrides };
 
-/**
- * Pick the best format this client will accept.
- *
- * Falls back to JPEG when the header says nothing useful — serving a format
- * the client never claimed is how you get a broken image in an old browser,
- * and JPEG is decodable everywhere.
- *
- * PNG sources with transparency are never downgraded to JPEG, which has no
- * alpha channel: a logo would silently gain a black background.
- */
-export function negotiateFormat(
-  acceptHeader: string | undefined | null,
-  options: { sourceHasAlpha?: boolean } = {},
-): NegotiationResult {
-  const accepted = parseAcceptHeader(acceptHeader);
+    if (source.byteLength > settings.maxSourceBytes) {
+      throw new ImageTooLargeError(source.byteLength, settings.maxSourceBytes);
+    }
 
-  if (accepted.size === 0) {
+    const format = this.formatFor(accept);
+    const digest = digestOf(source);
+    const { width: sourceWidth } = await this.processor.metadata(source);
+    const widths = widthsFor(sourceWidth, settings.breakpoints);
+
+    const variants: OptimizedVariant[] = [];
+    for (const width of widths) {
+      try {
+        const processed = await this.processor.process(
+          source,
+          { width },
+          format,
+          settings.quality,
+        );
+        variants.push({
+          width,
+          format,
+          key: variantKey(digest, width, format, settings.quality),
+          bytes: processed.size,
+        });
+      } catch (err) {
+        // One failed rendition should not cost the caller the whole set.
+        logger.warn(
+          `Variant ${width}w/${format} failed: ${(err as Error).message}`,
+        );
+      }
+    }
+
+    let placeholder: string | undefined;
+    if (settings.generatePlaceholder) {
+      try {
+        placeholder = await this.processor.lqip(source);
+      } catch (err) {
+        logger.warn(`Placeholder generation failed: ${(err as Error).message}`);
+      }
+    }
+
+    const smallest = variants.length
+      ? Math.min(...variants.map((variant) => variant.bytes))
+      : source.byteLength;
+
     return {
-      format: options.sourceHasAlpha ? 'png' : 'jpeg',
-      reason: 'no usable Accept header; using the universally decodable fallback',
+      variants,
+      srcset: buildSrcset(variants, baseUrl),
+      format,
+      placeholder,
+      savedBytes: Math.max(0, source.byteLength - smallest),
     };
   }
-
-  for (const candidate of PREFERENCE) {
-    if (!accepted.has(candidate)) continue;
-
-    // JPEG cannot carry alpha — fall through to PNG instead of flattening.
-    if (candidate === 'jpeg' && options.sourceHasAlpha) {
-      return {
-        format: 'png',
-        reason: 'source has transparency; JPEG would flatten the alpha channel',
-      };
-    }
-
-    return { format: candidate, reason: `client accepts ${candidate}` };
-  }
-
-  if (accepted.has('png')) {
-    return { format: 'png', reason: 'client accepts png only' };
-  }
-
-  return {
-    format: options.sourceHasAlpha ? 'png' : 'jpeg',
-    reason: 'no preferred format accepted; using the fallback',
-  };
 }
 
-export interface VariantSpec {
-  width: number;
-  /** Suffix for the generated asset, e.g. `-640w`. */
-  suffix: string;
-}
-
-/**
- * Default responsive breakpoints.
- *
- * Chosen to cover phone → desktop without generating a variant per device:
- * each roughly doubles, so the browser never downloads more than ~40% extra
- * pixels for its viewport.
- */
-export const DEFAULT_BREAKPOINTS = [320, 640, 1024, 1600] as const;
-
-/**
- * Plan which variants to generate for a source image.
- *
- * Never upscales: generating a 1600px variant from a 400px source produces a
- * blurry file that is *larger* than the original, which is the opposite of the
- * point. The source width is always included so there is an exact-fit variant.
- */
-export function planVariants(
-  sourceWidth: number,
-  breakpoints: readonly number[] = DEFAULT_BREAKPOINTS,
-): VariantSpec[] {
-  if (!Number.isFinite(sourceWidth) || sourceWidth <= 0) return [];
-
-  const widths = new Set<number>();
-  for (const bp of breakpoints) {
-    if (bp < sourceWidth) widths.add(bp);
-  }
-  widths.add(Math.floor(sourceWidth));
-
-  return [...widths]
-    .sort((a, b) => a - b)
-    .map((width) => ({ width, suffix: `-${width}w` }));
-}
-
-/**
- * Build a `srcset` value from generated variants.
- *
- * Returns an empty string for no variants, so a caller can omit the attribute
- * entirely rather than emitting `srcset=""`, which some browsers treat as a
- * broken candidate list.
- */
-export function buildSrcSet(
-  baseUrl: string,
-  variants: VariantSpec[],
-  extension: string,
-): string {
-  if (variants.length === 0) return '';
-
-  return variants
-    .map((v) => `${baseUrl}${v.suffix}.${extension} ${v.width}w`)
-    .join(', ');
-}
-
-export interface OptimizationPlan {
-  format: ImageFormat;
-  formatReason: string;
-  variants: VariantSpec[];
-  /** Encoder quality, 1–100. */
-  quality: number;
-  /** True when the source is already smaller than any breakpoint. */
-  singleVariant: boolean;
-}
-
-/**
- * Quality per format.
- *
- * AVIF and WebP hold up at lower numbers than JPEG for the same perceived
- * quality, so using one number for all three either bloats the modern formats
- * or degrades the fallback.
- */
-const QUALITY: Record<ImageFormat, number> = {
-  avif: 50,
-  webp: 75,
-  jpeg: 82,
-  png: 90,
-};
-
-/** Compose the full plan for one request. */
-export function planOptimization(params: {
-  sourceWidth: number;
-  acceptHeader?: string | null;
-  sourceHasAlpha?: boolean;
-  breakpoints?: readonly number[];
-  qualityOverride?: number;
-}): OptimizationPlan {
-  const negotiation = negotiateFormat(params.acceptHeader, {
-    sourceHasAlpha: params.sourceHasAlpha,
-  });
-  const variants = planVariants(params.sourceWidth, params.breakpoints);
-
-  const quality =
-    params.qualityOverride !== undefined && Number.isFinite(params.qualityOverride)
-      ? Math.min(100, Math.max(1, params.qualityOverride))
-      : QUALITY[negotiation.format];
-
-  return {
-    format: negotiation.format,
-    formatReason: negotiation.reason,
-    variants,
-    quality,
-    singleVariant: variants.length <= 1,
-  };
-}
-
-/**
- * `Vary` value for an optimised image response.
- *
- * Without `Vary: Accept`, a shared cache will happily serve the AVIF it stored
- * for a modern browser to a client that cannot decode it — a cache poisoning
- * bug that only shows up for a subset of users.
- */
-export const IMAGE_VARY_HEADER = 'Accept';
+export const imageOptimizer = new ImageOptimizerService();

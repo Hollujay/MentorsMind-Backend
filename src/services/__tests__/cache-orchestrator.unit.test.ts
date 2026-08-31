@@ -1,308 +1,282 @@
-/**
- * Multi-layer cache orchestrator tests (issue #864).
- */
-
 import {
   CacheOrchestrator,
-  type CacheEvent,
-} from '../cache-orchestrator.service';
-import { MemoryCacheLayer, type CacheLayer } from '../performance/cache-layer';
-import { CacheDependencyGraph } from '../performance/cache-dependency-graph';
+  DependencyGraph,
+  L1Store,
+  namespaceOf,
+  type InvalidationMessage,
+  type L2Store,
+  type L3Purger,
+  type OrchestratorEvent,
+} from "../cache-orchestrator.service";
 
-/** Scriptable layer so failure and unavailability are testable. */
-class FakeLayer implements CacheLayer {
-  readonly store = new Map<string, unknown>();
-  available = true;
-  failOn: Set<'get' | 'set' | 'del'> = new Set();
+class FakeL2 implements L2Store {
+  store = new Map<string, unknown>();
   getCalls = 0;
-  setCalls = 0;
-
-  constructor(readonly name: string) {}
 
   async get<T>(key: string): Promise<T | null> {
-    this.getCalls += 1;
-    if (this.failOn.has('get')) throw new Error(`${this.name} get failed`);
+    this.getCalls++;
     return (this.store.get(key) as T) ?? null;
   }
-
   async set<T>(key: string, value: T): Promise<void> {
-    this.setCalls += 1;
-    if (this.failOn.has('set')) throw new Error(`${this.name} set failed`);
     this.store.set(key, value);
   }
-
   async del(key: string): Promise<void> {
-    if (this.failOn.has('del')) throw new Error(`${this.name} del failed`);
     this.store.delete(key);
-  }
-
-  isAvailable(): boolean {
-    return this.available;
   }
 }
 
-describe('CacheOrchestrator', () => {
-  let l1: FakeLayer;
-  let l2: FakeLayer;
-  let orchestrator: CacheOrchestrator;
-  let events: CacheEvent[];
+class FakePurger implements L3Purger {
+  purged: string[] = [];
+  async purge(keys: string[]): Promise<void> {
+    this.purged.push(...keys);
+  }
+}
 
-  beforeEach(() => {
-    l1 = new FakeLayer('L1');
-    l2 = new FakeLayer('L2');
-    events = [];
-    orchestrator = new CacheOrchestrator({
-      layers: [l1, l2],
-      onEvent: (e) => events.push(e),
-    });
+describe("L1Store", () => {
+  it("reports an entry past its TTL as expired without dropping it", () => {
+    const store = new L1Store();
+    store.set("a", 1, 60, 1_000);
+
+    expect(store.get("a", 1_000)).toEqual({ value: 1, expired: false });
+    expect(store.get("a", 70_000)).toEqual({ value: 1, expired: true });
   });
 
-  it('requires at least one layer', () => {
-    expect(() => new CacheOrchestrator({ layers: [] })).toThrow();
+  it("evicts the least recently used entry once full", () => {
+    const store = new L1Store(2);
+    store.set("a", 1, 60);
+    store.set("b", 2, 60);
+    store.get("a"); // 'a' is now more recent than 'b'
+    store.set("c", 3, 60);
+
+    expect(store.size).toBe(2);
+    expect(store.get("b")).toBeNull();
+    expect(store.get("a")?.value).toBe(1);
+    expect(store.evictionCount).toBe(1);
   });
 
-  describe('read path', () => {
-    it('serves from the fastest layer without touching slower ones', async () => {
-      l1.store.set('k', 'from-l1');
-      l2.store.set('k', 'from-l2');
+  it("prunes only expired entries", () => {
+    const store = new L1Store();
+    store.set("fresh", 1, 60, 1_000);
+    store.set("stale", 2, 1, 1_000);
 
-      await expect(orchestrator.get('k')).resolves.toBe('from-l1');
-      expect(l2.getCalls).toBe(0);
-    });
-
-    it('falls through to a slower layer on a miss', async () => {
-      l2.store.set('k', 'from-l2');
-      await expect(orchestrator.get('k')).resolves.toBe('from-l2');
-    });
-
-    it('promotes a slow-layer hit into the fast layer', async () => {
-      l2.store.set('k', 'v');
-      await orchestrator.get('k');
-
-      // The next read must not need L2 at all.
-      expect(l1.store.get('k')).toBe('v');
-      expect(events.some((e) => e.type === 'promote' && e.layer === 'L1')).toBe(true);
-    });
-
-    it('does not promote when the fastest layer already served it', async () => {
-      l1.store.set('k', 'v');
-      await orchestrator.get('k');
-      expect(events.some((e) => e.type === 'promote')).toBe(false);
-    });
-
-    it('returns null when every layer misses', async () => {
-      await expect(orchestrator.get('nope')).resolves.toBeNull();
-      expect(events.some((e) => e.type === 'miss')).toBe(true);
-    });
-
-    it('skips an unavailable layer instead of failing', async () => {
-      l1.available = false;
-      l2.store.set('k', 'v');
-
-      await expect(orchestrator.get('k')).resolves.toBe('v');
-      expect(l1.getCalls).toBe(0);
-    });
-
-    it('degrades past a throwing layer rather than surfacing the error', async () => {
-      l1.failOn.add('get');
-      l2.store.set('k', 'v');
-
-      // A Redis blip should reach the origin, not become a 500.
-      await expect(orchestrator.get('k')).resolves.toBe('v');
-      expect(events.some((e) => e.type === 'error' && e.layer === 'L1')).toBe(true);
-    });
-
-    it('emits the serving layer on a hit', async () => {
-      l2.store.set('k', 'v');
-      await orchestrator.get('k');
-
-      const hit = events.find((e) => e.type === 'hit');
-      expect(hit?.layer).toBe('L2');
-    });
-  });
-
-  describe('write path', () => {
-    it('writes to every layer', async () => {
-      await orchestrator.set('k', 'v');
-      // A write that only reached L2 would leave L1 serving the old value.
-      expect(l1.store.get('k')).toBe('v');
-      expect(l2.store.get('k')).toBe('v');
-    });
-
-    it('still writes the remaining layers when one fails', async () => {
-      l1.failOn.add('set');
-      await orchestrator.set('k', 'v');
-      expect(l2.store.get('k')).toBe('v');
-    });
-
-    it('skips unavailable layers', async () => {
-      l2.available = false;
-      await orchestrator.set('k', 'v');
-      expect(l2.setCalls).toBe(0);
-    });
-  });
-
-  describe('getOrSet', () => {
-    it('returns a cached value without calling the loader', async () => {
-      l1.store.set('k', 'cached');
-      const loader = jest.fn();
-
-      await expect(orchestrator.getOrSet('k', loader)).resolves.toBe('cached');
-      expect(loader).not.toHaveBeenCalled();
-    });
-
-    it('loads and caches on a miss', async () => {
-      const loader = jest.fn().mockResolvedValue('loaded');
-
-      await expect(orchestrator.getOrSet('k', loader)).resolves.toBe('loaded');
-      expect(l1.store.get('k')).toBe('loaded');
-      expect(l2.store.get('k')).toBe('loaded');
-    });
-
-    it('collapses a concurrent stampede into one load', async () => {
-      // Built up front so `resolve` exists before the loader is ever invoked —
-      // `getOrSet` awaits the read path first, so the loader runs a tick later.
-      let resolve!: (v: string) => void;
-      const deferred = new Promise<string>((r) => {
-        resolve = r;
-      });
-      const loader = jest.fn(() => deferred);
-
-      const all = Promise.all([
-        orchestrator.getOrSet('hot', loader),
-        orchestrator.getOrSet('hot', loader),
-        orchestrator.getOrSet('hot', loader),
-      ]);
-
-      // Let the three reads miss and register their in-flight entry.
-      await Promise.resolve();
-      await Promise.resolve();
-      resolve('once');
-
-      await expect(all).resolves.toEqual(['once', 'once', 'once']);
-      // Without single-flighting, an expiring hot key sends every concurrent
-      // request to the origin at once.
-      expect(loader).toHaveBeenCalledTimes(1);
-    });
-
-    it('does not poison the key after a failed load', async () => {
-      const failing = jest.fn().mockRejectedValue(new Error('origin down'));
-      await expect(orchestrator.getOrSet('k', failing)).rejects.toThrow('origin down');
-
-      const succeeding = jest.fn().mockResolvedValue('ok');
-      await expect(orchestrator.getOrSet('k', succeeding)).resolves.toBe('ok');
-    });
-  });
-
-  describe('invalidation', () => {
-    it('drops a key from every layer', async () => {
-      await orchestrator.set('k', 'v');
-      await orchestrator.invalidate('k');
-
-      expect(l1.store.has('k')).toBe(false);
-      expect(l2.store.has('k')).toBe(false);
-    });
-
-    it('invalidates keys derived from a changed entity', async () => {
-      await orchestrator.set('search:cat:5', ['a'], { dependsOn: ['mentor:42'] });
-      await orchestrator.set('profile:42', { id: 42 }, { dependsOn: ['mentor:42'] });
-      await orchestrator.set('unrelated:1', 'keep', { dependsOn: ['mentor:99'] });
-
-      const dropped = await orchestrator.invalidateDependents('mentor:42');
-
-      expect(dropped.sort()).toEqual(['profile:42', 'search:cat:5']);
-      // None of these share a key prefix with `mentor:42` — pattern-based
-      // invalidation would have missed them.
-      expect(l1.store.has('unrelated:1')).toBe(true);
-    });
-
-    it('cascades through linked entities', async () => {
-      await orchestrator.set('listing:page1', [], { dependsOn: ['category:5'] });
-      orchestrator.linkDependency('mentor:42', 'category:5');
-
-      const dropped = await orchestrator.invalidateDependents('mentor:42');
-      expect(dropped).toContain('listing:page1');
-    });
-
-    it('returns an empty list for an entity nothing depends on', async () => {
-      await expect(orchestrator.invalidateDependents('ghost:1')).resolves.toEqual([]);
-    });
-  });
-
-  it('accepts an injected dependency graph', async () => {
-    const graph = new CacheDependencyGraph();
-    const o = new CacheOrchestrator({ layers: [l1], dependencyGraph: graph });
-
-    await o.set('k', 'v', { dependsOn: ['e:1'] });
-    expect(graph.directDependents('e:1')).toEqual(['k']);
-  });
-
-  it('survives a metrics sink that throws', async () => {
-    const o = new CacheOrchestrator({
-      layers: [l1],
-      onEvent: () => {
-        throw new Error('sink exploded');
-      },
-    });
-
-    await expect(o.set('k', 'v')).resolves.toBeUndefined();
+    expect(store.prune(5_000)).toBe(1);
+    expect(store.get("fresh", 5_000)?.value).toBe(1);
   });
 });
 
-describe('MemoryCacheLayer', () => {
-  it('stores and returns a value', async () => {
-    const layer = new MemoryCacheLayer();
-    await layer.set('k', { a: 1 }, 60);
-    await expect(layer.get('k')).resolves.toEqual({ a: 1 });
+describe("DependencyGraph", () => {
+  it("resolves keys reachable through a chain of tags", () => {
+    const graph = new DependencyGraph();
+    graph.addKey("page:mentor-list", ["mentors"]);
+    graph.addKey("page:mentor-42", ["mentor:42"]);
+    graph.addTagEdge("mentors", "mentor:42");
+
+    expect(graph.resolve(["mentor:42"]).sort()).toEqual([
+      "page:mentor-42",
+      "page:mentor-list",
+    ]);
   });
 
-  it('expires an entry once its TTL lapses', async () => {
-    let now = 1_000;
-    const layer = new MemoryCacheLayer({ now: () => now });
+  it("terminates on a cycle", () => {
+    const graph = new DependencyGraph();
+    graph.addKey("k", ["a"]);
+    graph.addTagEdge("a", "b");
+    graph.addTagEdge("b", "a");
 
-    await layer.set('k', 'v', 10);
-    now += 9_000;
-    await expect(layer.get('k')).resolves.toBe('v');
-
-    now += 2_000;
-    await expect(layer.get('k')).resolves.toBeNull();
+    expect(graph.resolve(["a"])).toEqual(["k"]);
   });
 
-  it('evicts the oldest entry at capacity', async () => {
-    const layer = new MemoryCacheLayer({ maxEntries: 2 });
+  it("forgets a key it no longer holds", () => {
+    const graph = new DependencyGraph();
+    graph.addKey("k", ["a"]);
+    graph.removeKey("k");
 
-    await layer.set('a', 1, 60);
-    await layer.set('b', 2, 60);
-    await layer.set('c', 3, 60);
+    expect(graph.resolve(["a"])).toEqual([]);
+  });
+});
 
-    // Unbounded growth in a long-lived process is a memory leak that presents
-    // as an OOM restart loop.
-    expect(layer.size()).toBe(2);
-    await expect(layer.get('a')).resolves.toBeNull();
-    await expect(layer.get('c')).resolves.toBe(3);
+describe("CacheOrchestrator", () => {
+  it("serves L1 before touching L2", async () => {
+    const l2 = new FakeL2();
+    const cache = new CacheOrchestrator({ l2 });
+    const loader = jest.fn().mockResolvedValue("value");
+
+    await cache.get("mentors:1", loader);
+    const second = await cache.get("mentors:1", loader);
+
+    expect(second).toEqual({ value: "value", tier: "l1", stale: false });
+    expect(loader).toHaveBeenCalledTimes(1);
+    expect(l2.getCalls).toBe(1); // only the first, cold read
   });
 
-  it('refreshing a key moves it to the back of the eviction order', async () => {
-    const layer = new MemoryCacheLayer({ maxEntries: 2 });
+  it("promotes an L2 hit into L1", async () => {
+    const l2 = new FakeL2();
+    l2.store.set("mentors:1", "from-redis");
+    const cache = new CacheOrchestrator({ l2 });
+    const loader = jest.fn();
 
-    await layer.set('a', 1, 60);
-    await layer.set('b', 2, 60);
-    await layer.set('a', 11, 60); // refresh a
-    await layer.set('c', 3, 60); // should evict b, not a
+    const first = await cache.get("mentors:1", loader);
+    const second = await cache.get("mentors:1", loader);
 
-    await expect(layer.get('a')).resolves.toBe(11);
-    await expect(layer.get('b')).resolves.toBeNull();
+    expect(first.tier).toBe("l2");
+    expect(second.tier).toBe("l1");
+    expect(loader).not.toHaveBeenCalled();
   });
 
-  it('deletes and clears', async () => {
-    const layer = new MemoryCacheLayer();
-    await layer.set('k', 'v', 60);
+  it("collapses concurrent misses into a single load", async () => {
+    const cache = new CacheOrchestrator({ l2: new FakeL2() });
+    let resolve!: (value: string) => void;
+    const loader = jest.fn(() => new Promise<string>((r) => (resolve = r)));
 
-    await layer.del('k');
-    await expect(layer.get('k')).resolves.toBeNull();
+    const reads = Promise.all([
+      cache.get("mentors:1", loader),
+      cache.get("mentors:1", loader),
+      cache.get("mentors:1", loader),
+    ]);
+    // The reads await the L2 lookup before reaching the loader, so let the
+    // microtask queue drain before resolving it.
+    await new Promise((r) => setImmediate(r));
+    resolve("value");
+    const results = await reads;
 
-    await layer.set('x', 1, 60);
-    layer.clear();
-    expect(layer.size()).toBe(0);
+    expect(loader).toHaveBeenCalledTimes(1);
+    expect(results.map((r) => r.value)).toEqual(["value", "value", "value"]);
+  });
+
+  it("serves a stale entry and refreshes behind the request", async () => {
+    const l1 = new L1Store();
+    const cache = new CacheOrchestrator({ l1, l2: new FakeL2() });
+    l1.set("mentors:1", "old", -1); // already expired
+    const loader = jest.fn().mockResolvedValue("new");
+
+    const stale = await cache.get("mentors:1", loader, {
+      staleWhileRevalidate: true,
+    });
+    expect(stale).toEqual({ value: "old", tier: "l1", stale: true });
+
+    await new Promise((r) => setImmediate(r));
+    expect(loader).toHaveBeenCalledTimes(1);
+    expect(l1.get("mentors:1")?.value).toBe("new");
+  });
+
+  it("invalidates every tier and every dependent key", async () => {
+    const l2 = new FakeL2();
+    const l3 = new FakePurger();
+    const cache = new CacheOrchestrator({ l2, l3 });
+
+    await cache.set("page:list", "a", { dependencies: ["mentors"] });
+    await cache.set("page:42", "b", { dependencies: ["mentor:42"] });
+    cache.dependsOn("mentors", "mentor:42");
+
+    const dropped = await cache.invalidateTags(["mentor:42"]);
+
+    expect(dropped.sort()).toEqual(["page:42", "page:list"]);
+    expect(l2.store.size).toBe(0);
+    expect(l3.purged.sort()).toEqual(["page:42", "page:list"]);
+    expect(cache.localSize).toBe(0);
+  });
+
+  it("broadcasts invalidations and drops L1 on a sibling message", async () => {
+    const published: InvalidationMessage[] = [];
+    let handler: (m: InvalidationMessage) => void = () => {};
+    const broadcaster = {
+      publish: async (m: InvalidationMessage) => {
+        published.push(m);
+      },
+      subscribe: async (h: (m: InvalidationMessage) => void) => {
+        handler = h;
+      },
+    };
+
+    const cache = new CacheOrchestrator({
+      l2: new FakeL2(),
+      broadcaster,
+      instanceId: "instance-a",
+    });
+    await cache.connect();
+    await cache.set("mentors:1", "value");
+
+    await cache.invalidateKeys(["mentors:1"]);
+    expect(published[0]).toEqual({
+      origin: "instance-a",
+      keys: ["mentors:1"],
+      tags: [],
+    });
+
+    await cache.set("mentors:2", "value");
+    handler({ origin: "instance-b", keys: ["mentors:2"], tags: [] });
+    expect(cache.localSize).toBe(0);
+  });
+
+  it("ignores its own broadcast", async () => {
+    let handler: (m: InvalidationMessage) => void = () => {};
+    const cache = new CacheOrchestrator({
+      l2: new FakeL2(),
+      broadcaster: {
+        publish: async () => {},
+        subscribe: async (h) => {
+          handler = h;
+        },
+      },
+      instanceId: "instance-a",
+    });
+    await cache.connect();
+    await cache.set("mentors:1", "value");
+
+    handler({ origin: "instance-a", keys: ["mentors:1"], tags: [] });
+
+    expect(cache.localSize).toBe(1);
+  });
+
+  it("reports the tier of every read to observers", async () => {
+    const events: OrchestratorEvent[] = [];
+    const cache = new CacheOrchestrator({ l2: new FakeL2() });
+    cache.observe((e) => events.push(e));
+
+    await cache.get("mentors:1", async () => "value");
+    await cache.get("mentors:1", async () => "value");
+
+    expect(events.map((e) => `${e.type}:${e.tier}`)).toEqual([
+      "set:null",
+      "miss:loader",
+      "hit:l1",
+    ]);
+    expect(events[0].namespace).toBe("mentors");
+  });
+
+  it("does not let a throwing observer break a read", async () => {
+    const cache = new CacheOrchestrator({ l2: new FakeL2() });
+    cache.observe(() => {
+      throw new Error("observer blew up");
+    });
+
+    await expect(cache.get("mentors:1", async () => "value")).resolves.toEqual({
+      value: "value",
+      tier: "loader",
+      stale: false,
+    });
+  });
+
+  it("does not fail an invalidation when the broadcast fails", async () => {
+    const cache = new CacheOrchestrator({
+      l2: new FakeL2(),
+      broadcaster: {
+        publish: async () => {
+          throw new Error("redis down");
+        },
+        subscribe: async () => {},
+      },
+    });
+    await cache.set("mentors:1", "value");
+
+    await expect(cache.invalidateKeys(["mentors:1"])).resolves.toBeUndefined();
+    expect(cache.localSize).toBe(0);
+  });
+});
+
+describe("namespaceOf", () => {
+  it("takes the first colon-delimited segment", () => {
+    expect(namespaceOf("mentors:http:abc")).toBe("mentors");
+    expect(namespaceOf("flat")).toBe("flat");
   });
 });

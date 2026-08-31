@@ -9,10 +9,11 @@ import {
 import { LoginAttemptsService } from "../services/loginAttempts.service";
 import { IpFilterService } from "../services/ipFilter.service";
 import pool from "../config/database";
-import { keyRotationJob } from "../jobs/keyRotation.job";
+import keyRotationJob from "../jobs/keyRotation.job";
 import { AuditLogArchivalJob } from "../jobs/auditLog.job";
 import { accountDeletionService } from "../services/accountDeletion.service";
 import { WebhookService } from "../services/webhook.service";
+import { PaymentReconciliationService } from "../services/payment-reconciliation.service";
 
 export const AdminController = {
   /** GET /admin/stats */
@@ -262,6 +263,44 @@ export const AdminController = {
         offset,
       } as any,
     );
+  },
+
+  /** GET /admin/payments/reconciliation */
+  async listPaymentReconciliations(req: AuthenticatedRequest, res: Response): Promise<void> {
+    const limit = parseInt(req.query.limit as string) || 50;
+    const offset = parseInt(req.query.offset as string) || 0;
+    const status = (req.query.status as string | undefined) ?? undefined;
+
+    const result = await PaymentReconciliationService.listDiscrepancies({
+      limit,
+      offset,
+      status: status as any,
+    });
+
+    ResponseUtil.success(
+      res,
+      result.rows,
+      "Payment reconciliation discrepancies retrieved successfully",
+      200,
+      {
+        total: result.total,
+        limit,
+        offset,
+      } as any,
+    );
+  },
+
+  /** PATCH /admin/payments/reconciliation/:id/review */
+  async reviewPaymentReconciliation(req: AuthenticatedRequest, res: Response): Promise<void> {
+    const { status, notes } = req.body ?? {};
+    const updated = await PaymentReconciliationService.reviewDiscrepancy(
+      req.params.id,
+      req.user!.id,
+      status,
+      notes,
+    );
+
+    ResponseUtil.success(res, updated, "Payment discrepancy reviewed successfully");
   },
 
   /** POST /admin/disputes/:id/resolve */

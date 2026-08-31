@@ -3,29 +3,54 @@ import { NlpSearchService } from "../services/nlp-search.service";
 
 export class NlpSearchController {
   static async search(req: Request, res: Response): Promise<void> {
-    const { q, type, minRating, maxPrice, language } = req.query;
+    const { q, minRating, maxPrice, language } = req.query;
     const userId = (req as any).user?.id;
 
-    const results = await NlpSearchService.search(q as string, userId, {
-      type: type as any,
-      minRating: minRating ? parseFloat(minRating as string) : undefined,
-      maxPrice: maxPrice ? parseFloat(maxPrice as string) : undefined,
-      language: language as string,
-    });
+    if (!q || typeof q !== "string") {
+      res.status(400).json({ success: false, message: "Query 'q' is required" });
+      return;
+    }
 
-    await NlpSearchService.logSearch(userId, q as string, results.length);
-    res.json({ success: true, data: results, total: results.length });
+    const overrides = {
+      minRating: minRating ? parseFloat(minRating as string) : undefined,
+      maxBudget: maxPrice ? parseFloat(maxPrice as string) : undefined,
+      language: language as string | undefined,
+    };
+
+    const { parsed, results } = await NlpSearchService.search(
+      q,
+      userId,
+      overrides,
+    );
+
+    res.json({
+      success: true,
+      data: { parsed, results },
+      total: results.length,
+    });
   }
 
   static async getSuggestions(req: Request, res: Response): Promise<void> {
     const { q } = req.query;
-    const suggestions = await NlpSearchService.getSuggestions(q as string);
-    res.json({ success: true, data: suggestions });
+    if (!q || typeof q !== "string") {
+      res.status(400).json({ success: false, message: "Query 'q' is required" });
+      return;
+    }
+    const suggestions = await NlpSearchService.getSuggestions(q);
+    const corrections = NlpSearchService.detectTypos(q);
+    res.json({
+      success: true,
+      data: { suggestions, corrections },
+    });
   }
 
   static async parseQuery(req: Request, res: Response): Promise<void> {
     const { q } = req.query;
-    const parsed = NlpSearchService.parseQuery(q as string);
+    if (!q || typeof q !== "string") {
+      res.status(400).json({ success: false, message: "Query 'q' is required" });
+      return;
+    }
+    const parsed = await NlpSearchService.parseQuery(q);
     res.json({ success: true, data: parsed });
   }
 }

@@ -1,249 +1,169 @@
 /**
- * CDN cache-policy configuration (issue #863).
+ * CDN and edge configuration (issue #863).
  *
- * Provider credentials and toggles already live in `src/config/env.ts`, and
- * `cdn-geo.config.ts` covers geographic routing. What was missing is the
- * *cache policy* layer: how long each class of asset should live at the edge
- * and in the browser, and which must never be cached at all.
+ * `cdn-geo.config.ts` holds the provider-specific cache strategies. This file
+ * holds the decisions that apply across providers: which provider is primary,
+ * which are failovers, what the edge is allowed to run, and how images are
+ * negotiated.
  *
- * Written as pure data plus pure functions so the header the CDN will actually
- * see is testable, which matters because a wrong `Cache-Control` is invisible
- * until content is stale for hours with no way to pull it back.
+ * Everything reads from the environment with a working default, so a developer
+ * without CDN credentials gets pass-through behaviour rather than a crash.
  */
 
-export type AssetClass =
-  /** Fingerprinted bundles — the filename changes when the content does. */
-  | 'immutable'
-  /** Images, fonts, other media served under a stable path. */
-  | 'media'
-  /** Rendered pages that tolerate brief staleness. */
-  | 'page'
-  /** JSON responses that are safe to cache for a short window. */
-  | 'api-cacheable'
-  /** Anything user-specific or authenticated. */
-  | 'private'
-  /** Auth, payments, anything that must never be stored. */
-  | 'no-store';
+export type CDNProviderName = "cloudfront" | "cloudflare" | "fastly";
 
-export interface CachePolicy {
-  /** Browser lifetime, seconds. */
-  maxAge: number;
-  /** Edge/shared-cache lifetime, seconds. */
-  sharedMaxAge: number;
-  /** How long a stale copy may be served while revalidating behind it. */
-  staleWhileRevalidate: number;
-  /** How long a stale copy may be served when the origin is failing. */
-  staleIfError: number;
-  /** `public` allows shared caches to store it; `private` does not. */
-  visibility: 'public' | 'private';
-  immutable?: boolean;
-  noStore?: boolean;
+export interface ImageNegotiationConfig {
+  /** Formats to serve, best first. The first one the client accepts wins. */
+  preferredFormats: ImageDeliveryFormat[];
+  /** Widths generated for a responsive srcset. */
+  breakpoints: number[];
+  /** Quality for lossy formats, 1–100. */
+  quality: number;
+  /** Emit a blurred placeholder alongside each variant. */
+  generatePlaceholder: boolean;
+  /** Refuse to process anything larger, in bytes. */
+  maxSourceBytes: number;
 }
 
-const YEAR = 31_536_000;
-const DAY = 86_400;
-const HOUR = 3_600;
-const MINUTE = 60;
+export type ImageDeliveryFormat = "avif" | "webp" | "jpeg" | "png";
 
-/**
- * Default policy per asset class.
- *
- * `staleIfError` is generous almost everywhere on purpose: serving slightly
- * stale content during an origin incident is nearly always better than serving
- * an error page, and it is the cheapest availability win a CDN offers.
- */
-export const CACHE_POLICIES: Record<AssetClass, CachePolicy> = {
-  immutable: {
-    // Safe only because the filename is content-addressed: a change ships a
-    // new URL, so nothing has to expire.
-    maxAge: YEAR,
-    sharedMaxAge: YEAR,
-    staleWhileRevalidate: 0,
-    staleIfError: 0,
-    visibility: 'public',
-    immutable: true,
-  },
-  media: {
-    maxAge: DAY,
-    sharedMaxAge: 30 * DAY,
-    staleWhileRevalidate: DAY,
-    staleIfError: 7 * DAY,
-    visibility: 'public',
-  },
-  page: {
-    // Short browser TTL, long edge TTL: a purge reaches the edge, but nothing
-    // can reach a copy already sitting in someone's browser.
-    maxAge: 0,
-    sharedMaxAge: 5 * MINUTE,
-    staleWhileRevalidate: HOUR,
-    staleIfError: DAY,
-    visibility: 'public',
-  },
-  'api-cacheable': {
-    maxAge: 0,
-    sharedMaxAge: 30,
-    staleWhileRevalidate: 2 * MINUTE,
-    staleIfError: 10 * MINUTE,
-    visibility: 'public',
-  },
-  private: {
-    maxAge: 0,
-    sharedMaxAge: 0,
-    staleWhileRevalidate: 0,
-    staleIfError: 0,
-    visibility: 'private',
-  },
-  'no-store': {
-    maxAge: 0,
-    sharedMaxAge: 0,
-    staleWhileRevalidate: 0,
-    staleIfError: 0,
-    visibility: 'private',
-    noStore: true,
-  },
+export interface EdgeConfig {
+  /** Run edge functions at all. */
+  enabled: boolean;
+  /** Milliseconds an edge function may run before it is abandoned. */
+  timeoutMs: number;
+  /** Regions the functions are deployed to, for reporting. */
+  regions: string[];
+}
+
+export interface CDNConfiguration {
+  primary: CDNProviderName;
+  /** Tried in order when the primary is unhealthy. */
+  failovers: CDNProviderName[];
+  /** Public base URLs, one per provider. */
+  domains: Partial<Record<CDNProviderName, string>>;
+  images: ImageNegotiationConfig;
+  edge: EdgeConfig;
+}
+
+/** MIME type for each delivery format, used in Accept negotiation. */
+export const IMAGE_MIME_TYPES: Record<ImageDeliveryFormat, string> = {
+  avif: "image/avif",
+  webp: "image/webp",
+  jpeg: "image/jpeg",
+  png: "image/png",
 };
 
-/**
- * Render a policy as a `Cache-Control` value.
- *
- * `no-store` short-circuits everything: emitting it alongside `max-age` is a
- * contradiction that different caches resolve differently, which is the worst
- * possible outcome for something protecting authenticated content.
- */
-export function toCacheControl(policy: CachePolicy): string {
-  if (policy.noStore) return 'no-store, no-cache, must-revalidate';
+export const DEFAULT_BREAKPOINTS = [320, 640, 960, 1280, 1920];
 
-  const parts: string[] = [policy.visibility];
-  parts.push(`max-age=${Math.max(0, policy.maxAge)}`);
-
-  if (policy.visibility === 'public' && policy.sharedMaxAge > 0) {
-    parts.push(`s-maxage=${policy.sharedMaxAge}`);
-  }
-  if (policy.staleWhileRevalidate > 0) {
-    parts.push(`stale-while-revalidate=${policy.staleWhileRevalidate}`);
-  }
-  if (policy.staleIfError > 0) {
-    parts.push(`stale-if-error=${policy.staleIfError}`);
-  }
-  if (policy.immutable) parts.push('immutable');
-  if (policy.visibility === 'private' && policy.maxAge === 0) {
-    parts.push('no-cache');
-  }
-
-  return parts.join(', ');
+function envList(name: string, fallback: string[]): string[] {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  return raw
+    .split(",")
+    .map((part) => part.trim())
+    .filter(Boolean);
 }
 
-/** Extensions treated as long-lived media. */
-const MEDIA_EXTENSIONS = new Set([
-  'png', 'jpg', 'jpeg', 'gif', 'webp', 'avif', 'svg', 'ico',
-  'woff', 'woff2', 'ttf', 'otf', 'mp4', 'webm', 'pdf',
-]);
+function envInt(name: string, fallback: number): number {
+  const parsed = Number.parseInt(process.env[name] ?? "", 10);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
 
-/** Path prefixes that must never be cached, regardless of extension. */
-const NEVER_CACHE_PREFIXES = ['/auth', '/api/auth', '/payments', '/api/payments', '/admin'];
+/** Parsed, positive, ascending breakpoints, or the defaults when none parse. */
+function envBreakpoints(): number[] {
+  const parsed = envList("CDN_IMAGE_BREAKPOINTS", [])
+    .map((value) => Number.parseInt(value, 10))
+    .filter((value) => Number.isFinite(value) && value > 0)
+    .sort((a, b) => a - b);
+  return parsed.length > 0 ? parsed : DEFAULT_BREAKPOINTS;
+}
+
+function envProvider(name: string, fallback: CDNProviderName): CDNProviderName {
+  const raw = process.env[name];
+  return raw === "cloudfront" || raw === "cloudflare" || raw === "fastly"
+    ? raw
+    : fallback;
+}
+
+export function loadCDNConfig(): CDNConfiguration {
+  const failovers = envList("CDN_FAILOVER_PROVIDERS", []).filter(
+    (p): p is CDNProviderName =>
+      p === "cloudfront" || p === "cloudflare" || p === "fastly",
+  );
+
+  return {
+    primary: envProvider("CDN_PRIMARY_PROVIDER", "cloudfront"),
+    failovers,
+    domains: {
+      cloudfront: process.env.CDN_CLOUDFRONT_DOMAIN,
+      cloudflare: process.env.CDN_CLOUDFLARE_DOMAIN,
+      fastly: process.env.CDN_FASTLY_DOMAIN,
+    },
+    images: {
+      preferredFormats: envList("CDN_IMAGE_FORMATS", [
+        "avif",
+        "webp",
+        "jpeg",
+      ]).filter(
+        (f): f is ImageDeliveryFormat =>
+          f === "avif" || f === "webp" || f === "jpeg" || f === "png",
+      ),
+      breakpoints: envBreakpoints(),
+      quality: envInt("CDN_IMAGE_QUALITY", 80),
+      generatePlaceholder: process.env.CDN_IMAGE_PLACEHOLDER !== "false",
+      maxSourceBytes: envInt("CDN_IMAGE_MAX_BYTES", 15 * 1024 * 1024),
+    },
+    edge: {
+      enabled: process.env.CDN_EDGE_ENABLED === "true",
+      timeoutMs: envInt("CDN_EDGE_TIMEOUT_MS", 50),
+      regions: envList("CDN_EDGE_REGIONS", ["global"]),
+    },
+  };
+}
+
+export const cdnConfig = loadCDNConfig();
 
 /**
- * A content hash in the filename, e.g. `app.4f3a91c2.js`.
+ * Pick the best format the client will accept.
  *
- * At least 8 hex characters between dots — short enough to catch real build
- * fingerprints, long enough not to match `v2` or a date.
+ * Falls back to the last preferred format when the header is missing or offers
+ * only a wildcard — serving AVIF to a client that never said it understands it
+ * is how "the images are broken on Safari 14" tickets happen.
  */
-const FINGERPRINTED = /\.[0-9a-f]{8,}\.[a-z0-9]+$/i;
+export function negotiateImageFormat(
+  acceptHeader: string | undefined,
+  config: ImageNegotiationConfig = cdnConfig.images,
+): ImageDeliveryFormat {
+  const fallback =
+    config.preferredFormats[config.preferredFormats.length - 1] ?? "jpeg";
+  if (!acceptHeader) return fallback;
 
-/**
- * Classify a request path.
- *
- * Order matters: the never-cache prefixes are checked before anything else, so
- * a path like `/auth/logo.png` is not classified as cacheable media just
- * because of its extension.
- */
-export function classifyAsset(path: string, isAuthenticated = false): AssetClass {
-  const clean = path.split('?')[0].toLowerCase();
-
-  if (NEVER_CACHE_PREFIXES.some((p) => clean === p || clean.startsWith(`${p}/`))) {
-    return 'no-store';
+  const accepted = acceptHeader.toLowerCase();
+  for (const format of config.preferredFormats) {
+    if (accepted.includes(IMAGE_MIME_TYPES[format])) return format;
   }
-
-  if (isAuthenticated) return 'private';
-
-  if (FINGERPRINTED.test(clean)) return 'immutable';
-
-  const ext = clean.includes('.') ? clean.slice(clean.lastIndexOf('.') + 1) : '';
-  if (MEDIA_EXTENSIONS.has(ext)) return 'media';
-
-  if (clean.startsWith('/api/')) return 'api-cacheable';
-
-  return 'page';
+  return fallback;
 }
 
-/** Convenience: classify a path and render its header in one step. */
-export function cacheControlFor(path: string, isAuthenticated = false): string {
-  return toCacheControl(CACHE_POLICIES[classifyAsset(path, isAuthenticated)]);
+/** Public base URL for a provider, or null when it is not configured. */
+export function domainFor(
+  provider: CDNProviderName,
+  config: CDNConfiguration = cdnConfig,
+): string | null {
+  const domain = config.domains[provider];
+  return domain && domain.length > 0 ? domain.replace(/\/+$/, "") : null;
 }
 
-export interface CdnProviderCapabilities {
-  /** Supports purging by wildcard rather than exact path only. */
-  wildcardPurge: boolean;
-  /** Supports tag/surrogate-key based purging. */
-  tagPurge: boolean;
-  /** Can run edge functions. */
-  edgeFunctions: boolean;
-  /** Maximum paths accepted in a single purge request. */
-  maxPurgePaths: number;
-}
-
-/**
- * Per-provider capabilities.
- *
- * Purge batching in particular differs enough between providers to matter: a
- * caller that assumes CloudFront's 3,000-path batch against Cloudflare's 30
- * gets a rejected request during an incident, which is exactly when a purge
- * needs to work.
- */
-export const PROVIDER_CAPABILITIES: Record<string, CdnProviderCapabilities> = {
-  cloudfront: {
-    wildcardPurge: true,
-    tagPurge: false,
-    edgeFunctions: true,
-    maxPurgePaths: 3_000,
-  },
-  cloudflare: {
-    wildcardPurge: false,
-    tagPurge: true,
-    edgeFunctions: true,
-    maxPurgePaths: 30,
-  },
-  fastly: {
-    wildcardPurge: false,
-    tagPurge: true,
-    edgeFunctions: true,
-    maxPurgePaths: 256,
-  },
-};
-
-/** Capabilities for a provider, or `null` if unknown. */
-export function capabilitiesFor(provider: string | undefined): CdnProviderCapabilities | null {
-  if (!provider) return null;
-  return PROVIDER_CAPABILITIES[provider.toLowerCase()] ?? null;
-}
-
-/**
- * Split paths into provider-sized purge batches.
- *
- * Returns a single empty-free list when there is nothing to purge, so callers
- * can iterate without a length check.
- */
-export function batchPurgePaths(
-  paths: string[],
-  provider: string | undefined,
-): string[][] {
-  const unique = [...new Set(paths.filter((p) => p.trim().length > 0))];
-  if (unique.length === 0) return [];
-
-  const limit = capabilitiesFor(provider)?.maxPurgePaths ?? 100;
-  const batches: string[][] = [];
-  for (let i = 0; i < unique.length; i += limit) {
-    batches.push(unique.slice(i, i + limit));
-  }
-  return batches;
+/** Providers to try, primary first, skipping any without a configured domain. */
+export function providerChain(
+  config: CDNConfiguration = cdnConfig,
+): CDNProviderName[] {
+  const ordered = [config.primary, ...config.failovers];
+  const seen = new Set<CDNProviderName>();
+  return ordered.filter((provider) => {
+    if (seen.has(provider)) return false;
+    seen.add(provider);
+    return domainFor(provider, config) !== null;
+  });
 }

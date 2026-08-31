@@ -1,58 +1,47 @@
-# Scaling configuration (issue #862)
+# Scaling
 
-Policy definitions for the predictive auto-scaler. The decision engine lives in
-`src/services/auto-scaler.service.ts`; this directory holds the tunables an
-operator changes without touching code.
+Two layers, doing different jobs.
 
-## What is and is not implemented
+| Layer | File | Reacts to | Role |
+| --- | --- | --- | --- |
+| Kubernetes HPA | `hpa.yaml` | Observed CPU and memory | Safety net. Always on, never predictive. |
+| Scaling optimizer | `src/workers/scaling-optimizer.worker.ts` | Predicted request rate | Adds capacity *before* the load arrives. |
 
-| Piece | Status |
-|---|---|
-| Load forecasting (`LoadPredictorService`) | Implemented, unit-tested |
-| Scaling decisions (`AutoScalerService`) | Implemented, unit-tested |
-| Optimiser loop (`ScalingOptimizerWorker`) | Implemented, unit-tested against a fake provider |
-| SLA attainment + cost accounting | Implemented, unit-tested |
-| **Cloud provider adapters** | **Not implemented — see below** |
+The HPA is the floor, not the plan. It only moves once utilisation has already
+risen, which is one replica-startup too late for a traffic pattern as sharp as
+session bookings at the top of the hour. The optimizer predicts the next window
+from the weekly seasonal profile and moves first; the HPA still catches anything
+the prediction missed.
 
-`ScalingProvider` (in `src/workers/scaling-optimizer.worker.ts`) is the seam a
-platform plugs into. It needs three operations: read the current instance
-count, read current load, set the instance count.
+## Constraints the optimizer enforces
 
-No concrete adapter ships in this PR. Writing an ECS, Kubernetes HPA or
-Cloud Run client that has never been run against a real control plane would be
-guesswork, and a scaling bug that only appears in production is an expensive
-way to discover an API mismatch. The adapter should be written against
-whichever platform this service actually deploys to, with integration tests
-that can talk to it.
+The policy lives in `src/services/auto-scaler.service.ts` (`DEFAULT_POLICY`).
 
-## Policy tunables
+- **SLO breaches outrank the forecast.** p95 over budget scales up on the
+  observation, whatever the prediction says.
+- **Cooldowns are asymmetric.** 60s up, 300s down. Scaling down is the direction
+  that causes incidents.
+- **Low confidence holds.** A prediction below `MIN_ACTIONABLE_CONFIDENCE` (0.4)
+  changes nothing.
+- **Scale-down is capped per step** at `maxScaleDownStep`, so a mispredicted dip
+  cannot strip the fleet in one tick.
 
-`ScalingPolicy` fields, and why each exists:
+Set `minReplicas` on the HPA at or above the optimizer's `minReplicas`, or the
+two will fight over the floor.
 
-| Field | Purpose |
-|---|---|
-| `minInstances` / `maxInstances` | Hard floor and ceiling. |
-| `capacityPerInstance` | Load units one instance serves while meeting SLA. Measure it; do not guess. |
-| `targetUtilisation` | Fraction of capacity to aim for. The remainder is headroom that absorbs forecast error. |
-| `scaleUpCooldownSeconds` | Blocks a second scale-up while the first is still booting. |
-| `scaleDownCooldownSeconds` | Longer than the up cooldown on purpose — brief over-provisioning is far cheaper than dropping traffic. |
-| `maxScaleDownStep` | Caps how much capacity a single decision can remove. |
-| `minForecastConfidence` | Below this, the forecast is ignored and scaling is purely reactive. |
-| `costCeilingInstances` | Optional spend cap that binds before `maxInstances`, so the reported constraint names the real limit. |
+## Multi-cloud
 
-## Example profiles
+`ScalingExecutor` is the only cloud-specific surface — `currentReplicas()` and
+`scaleTo(n)`. Kubernetes, an AWS ASG, or a dry run each implement those two
+methods; the policy above is shared and does not change per provider.
 
-`policies.example.json` holds three starting points — conservative, balanced
-and aggressive. They are illustrative: `capacityPerInstance` in particular must
-come from load-testing this service, since it is the number every other
-calculation is derived from.
+## Running it
 
-## Tuning notes
+```ts
+const worker = new ScalingOptimizerWorker({ metrics: prometheusMetricsSource });
+worker.start();
+```
 
-- **Start conservative.** An over-eager scaler costs money continuously; an
-  under-eager one costs money once, during an incident you will notice.
-- **Set the forecast horizon above instance start-up time.** A prediction that
-  lands inside the boot window arrives too late to help.
-- **Watch `slaSnapshot().attainment` alongside `costUnits()`.** Either alone is
-  misleading — perfect attainment at triple the cost is not a win, and neither
-  is a cheap month with breaches in it.
+`worker.costReport()` returns the scale-up/scale-down/hold counts and the net
+replica delta over the retained history, which is what the scaling dashboard
+plots against spend.

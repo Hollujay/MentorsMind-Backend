@@ -1,16 +1,19 @@
 /**
- * Cache analytics and optimisation recommendations (issue #864).
+ * Cache analytics and optimization recommendations (issue #864).
  *
- * A single global hit-rate hides everything useful. 85% overall can be one
- * namespace at 99% masking another at 20% — and the 20% is the one costing
- * money. Stats are therefore kept per namespace, and the recommendations point
- * at specific namespaces with a reason attached.
+ * Subscribes to the orchestrator's event stream and keeps per-namespace
+ * counters in memory. The point is not another dashboard metric: it is to turn
+ * the numbers into a specific, actionable statement — which namespace to warm,
+ * which TTL is too short, which key is too specific to ever hit.
  *
- * Pure in-memory accounting with no external dependencies, so it is testable
- * directly and cheap enough to run on every cache event.
+ * Counters are bounded and reset-able, so this can run permanently in-process
+ * without growing.
  */
 
-import type { CacheEvent } from './cache-orchestrator.service';
+import type {
+  OrchestratorEvent,
+  CacheTier,
+} from "./cache-orchestrator.service";
 
 export interface NamespaceStats {
   namespace: string;
@@ -18,29 +21,28 @@ export interface NamespaceStats {
   misses: number;
   sets: number;
   invalidations: number;
-  errors: number;
-  /** hits / (hits + misses), 0–1. `null` until there is at least one read. */
-  hitRate: number | null;
-  /** Mean lookup duration in ms across recorded reads. */
-  avgLookupMs: number | null;
-  /** Hits served by each layer, keyed by layer name. */
-  hitsByLayer: Record<string, number>;
+  /** Hits served from each tier. */
+  tierHits: Record<CacheTier | "loader", number>;
+  /** Mean duration of a served read, in milliseconds. */
+  avgReadMs: number;
+  /** Mean duration of a miss that fell through to the loader. */
+  avgLoadMs: number;
+  hitRate: number;
 }
 
-export type RecommendationKind =
-  | 'increase-ttl'
-  | 'add-warming'
-  | 'reconsider-caching'
-  | 'investigate-errors'
-  | 'promote-to-l1';
+export type RecommendationSeverity = "info" | "warning" | "critical";
 
 export interface Recommendation {
   namespace: string;
-  kind: RecommendationKind;
-  /** Why this is being suggested, in terms an on-call engineer can act on. */
-  reason: string;
-  /** Rough ordering hint: higher is more worth doing. */
-  impact: number;
+  severity: RecommendationSeverity;
+  /** Machine-readable code, stable across wording changes. */
+  code:
+    | "low-hit-rate"
+    | "l1-bypassed"
+    | "expensive-loader"
+    | "invalidation-churn"
+    | "unused-namespace";
+  message: string;
 }
 
 interface MutableStats {
@@ -48,194 +50,163 @@ interface MutableStats {
   misses: number;
   sets: number;
   invalidations: number;
-  errors: number;
-  totalLookupMs: number;
-  lookupSamples: number;
-  hitsByLayer: Map<string, number>;
+  tierHits: Record<CacheTier | "loader", number>;
+  readMsTotal: number;
+  readCount: number;
+  loadMsTotal: number;
+  loadCount: number;
 }
 
-/**
- * Namespace = the segment before the first colon.
- *
- * Matches the `namespace:part:part` convention `CacheKeyBuilder` already uses
- * elsewhere in the codebase, so analytics group the same way keys are built.
- */
-export function namespaceOf(key: string): string {
-  const idx = key.indexOf(':');
-  return idx === -1 ? key : key.slice(0, idx);
-}
+/** Below this hit rate a namespace is probably mis-keyed or under-TTL'd. */
+export const LOW_HIT_RATE_THRESHOLD = 0.5;
+/** A loader slower than this is worth warming rather than serving cold. */
+export const EXPENSIVE_LOADER_MS = 250;
+/** More invalidations than sets means the cache is being thrashed. */
+export const CHURN_RATIO = 1;
+/** Ignore namespaces with too little traffic to draw a conclusion from. */
+export const MIN_SAMPLES = 20;
 
-/** Minimum reads before a namespace is judged — small samples are noise. */
-const MIN_SAMPLE = 20;
+function emptyStats(): MutableStats {
+  return {
+    hits: 0,
+    misses: 0,
+    sets: 0,
+    invalidations: 0,
+    tierHits: { l1: 0, l2: 0, l3: 0, loader: 0 },
+    readMsTotal: 0,
+    readCount: 0,
+    loadMsTotal: 0,
+    loadCount: 0,
+  };
+}
 
 export class CacheAnalyticsService {
-  private readonly stats = new Map<string, MutableStats>();
+  private stats = new Map<string, MutableStats>();
 
-  private bucket(namespace: string): MutableStats {
-    let entry = this.stats.get(namespace);
-    if (!entry) {
-      entry = {
-        hits: 0,
-        misses: 0,
-        sets: 0,
-        invalidations: 0,
-        errors: 0,
-        totalLookupMs: 0,
-        lookupSamples: 0,
-        hitsByLayer: new Map(),
-      };
-      this.stats.set(namespace, entry);
-    }
-    return entry;
-  }
-
-  /** Feed straight from `CacheOrchestrator`'s `onEvent` hook. */
-  record(event: CacheEvent): void {
-    const bucket = this.bucket(namespaceOf(event.key));
+  /** Attach to an orchestrator's event stream. */
+  record(event: OrchestratorEvent): void {
+    const entry = this.stats.get(event.namespace) ?? emptyStats();
 
     switch (event.type) {
-      case 'hit':
-        bucket.hits += 1;
-        if (event.layer) {
-          bucket.hitsByLayer.set(
-            event.layer,
-            (bucket.hitsByLayer.get(event.layer) ?? 0) + 1,
-          );
-        }
+      case "hit":
+        entry.hits++;
+        entry.readMsTotal += event.durationMs;
+        entry.readCount++;
+        if (event.tier) entry.tierHits[event.tier]++;
         break;
-      case 'miss':
-        bucket.misses += 1;
+      case "miss":
+        entry.misses++;
+        entry.loadMsTotal += event.durationMs;
+        entry.loadCount++;
         break;
-      case 'set':
-        bucket.sets += 1;
+      case "set":
+        entry.sets++;
         break;
-      case 'invalidate':
-        bucket.invalidations += 1;
-        break;
-      case 'error':
-        bucket.errors += 1;
-        break;
-      case 'promote':
-        // Promotions are an internal mechanic, not a read outcome — counting
-        // them as hits would inflate the rate the recommendations key off.
+      case "invalidate":
+        entry.invalidations++;
         break;
     }
 
-    if (
-      typeof event.durationMs === 'number' &&
-      (event.type === 'hit' || event.type === 'miss')
-    ) {
-      bucket.totalLookupMs += event.durationMs;
-      bucket.lookupSamples += 1;
-    }
+    this.stats.set(event.namespace, entry);
   }
 
-  statsFor(namespace: string): NamespaceStats | null {
-    const bucket = this.stats.get(namespace);
-    if (!bucket) return null;
-    return this.project(namespace, bucket);
-  }
-
-  allStats(): NamespaceStats[] {
+  snapshot(): NamespaceStats[] {
     return [...this.stats.entries()]
-      .map(([namespace, bucket]) => this.project(namespace, bucket))
+      .map(([namespace, s]) => {
+        const total = s.hits + s.misses;
+        return {
+          namespace,
+          hits: s.hits,
+          misses: s.misses,
+          sets: s.sets,
+          invalidations: s.invalidations,
+          tierHits: { ...s.tierHits },
+          avgReadMs: s.readCount === 0 ? 0 : s.readMsTotal / s.readCount,
+          avgLoadMs: s.loadCount === 0 ? 0 : s.loadMsTotal / s.loadCount,
+          hitRate: total === 0 ? 0 : s.hits / total,
+        };
+      })
       .sort((a, b) => b.hits + b.misses - (a.hits + a.misses));
   }
 
-  private project(namespace: string, bucket: MutableStats): NamespaceStats {
-    const reads = bucket.hits + bucket.misses;
-    return {
-      namespace,
-      hits: bucket.hits,
-      misses: bucket.misses,
-      sets: bucket.sets,
-      invalidations: bucket.invalidations,
-      errors: bucket.errors,
-      hitRate: reads > 0 ? bucket.hits / reads : null,
-      avgLookupMs:
-        bucket.lookupSamples > 0 ? bucket.totalLookupMs / bucket.lookupSamples : null,
-      hitsByLayer: Object.fromEntries(bucket.hitsByLayer),
-    };
-  }
-
   /**
-   * Derive actionable recommendations.
+   * Turn the counters into recommendations.
    *
-   * Thresholds are deliberately conservative — a recommendation engine that
-   * fires constantly gets ignored, which is worse than one that says nothing.
-   * Namespaces below `MIN_SAMPLE` reads are skipped entirely.
+   * Namespaces below `MIN_SAMPLES` are skipped — advice drawn from three
+   * requests is noise, and acting on it makes the cache worse.
    */
   recommendations(): Recommendation[] {
     const out: Recommendation[] = [];
 
-    for (const stat of this.allStats()) {
-      const reads = stat.hits + stat.misses;
-      if (reads < MIN_SAMPLE || stat.hitRate === null) continue;
+    for (const s of this.snapshot()) {
+      const total = s.hits + s.misses;
+      if (total < MIN_SAMPLES) continue;
 
-      if (stat.errors > 0 && stat.errors / reads > 0.05) {
+      if (s.hitRate < LOW_HIT_RATE_THRESHOLD) {
         out.push({
-          namespace: stat.namespace,
-          kind: 'investigate-errors',
-          reason: `${stat.errors} cache errors across ${reads} reads (${(
-            (stat.errors / reads) * 100
-          ).toFixed(1)}%) — a layer is probably unhealthy.`,
-          impact: 90,
+          namespace: s.namespace,
+          severity: s.hitRate < 0.2 ? "critical" : "warning",
+          code: "low-hit-rate",
+          message:
+            `${s.namespace} hits ${(s.hitRate * 100).toFixed(1)}% of ${total} reads. ` +
+            "Either the TTL expires before the next read, or the key carries a " +
+            "parameter specific enough that it is never requested twice.",
         });
       }
 
-      // Churn: written about as often as read, so entries rarely survive to be
-      // reused. Caching is costing writes without buying reads.
-      if (stat.hitRate < 0.2 && stat.sets > stat.hits) {
+      if (s.hits >= MIN_SAMPLES && s.tierHits.l1 === 0) {
         out.push({
-          namespace: stat.namespace,
-          kind: 'reconsider-caching',
-          reason: `Hit rate ${(stat.hitRate * 100).toFixed(1)}% with more writes (${
-            stat.sets
-          }) than hits (${stat.hits}) — this namespace may not be worth caching.`,
-          impact: 70,
-        });
-      } else if (stat.hitRate < 0.5) {
-        // Misses dominate but the data is reused — usually a TTL that expires
-        // before the next read arrives.
-        out.push({
-          namespace: stat.namespace,
-          kind: 'increase-ttl',
-          reason: `Hit rate ${(stat.hitRate * 100).toFixed(
-            1,
-          )}% over ${reads} reads — entries are likely expiring before reuse.`,
-          impact: 60,
+          namespace: s.namespace,
+          severity: "warning",
+          code: "l1-bypassed",
+          message:
+            `${s.namespace} serves every hit from L2 and never from L1. ` +
+            "Entries are being evicted before a second read — raise the L1 ceiling " +
+            "or check that this namespace writes to the l1 tier.",
         });
       }
 
-      // High traffic and a healthy rate, but the first read still misses:
-      // worth preloading so the cold path is never on the request path.
-      if (stat.hitRate >= 0.5 && stat.misses > MIN_SAMPLE && reads > 100) {
+      if (s.avgLoadMs > EXPENSIVE_LOADER_MS && s.misses > 0) {
         out.push({
-          namespace: stat.namespace,
-          kind: 'add-warming',
-          reason: `${stat.misses} misses on a high-traffic namespace (${reads} reads) — a warmer would absorb the cold path.`,
-          impact: 50,
+          namespace: s.namespace,
+          severity:
+            s.avgLoadMs > EXPENSIVE_LOADER_MS * 4 ? "critical" : "warning",
+          code: "expensive-loader",
+          message:
+            `${s.namespace} takes ${s.avgLoadMs.toFixed(0)}ms on a miss across ` +
+            `${s.misses} misses. Register a warmer so this cost is paid off the ` +
+            "request path.",
         });
       }
 
-      // Served almost entirely from the slow tier: the fast tier is either too
-      // small or the promotion TTL is too short.
-      const l1 = stat.hitsByLayer.L1 ?? 0;
-      const l2 = stat.hitsByLayer.L2 ?? 0;
-      if (stat.hits > MIN_SAMPLE && l2 > 0 && l1 / stat.hits < 0.2) {
+      if (s.sets > 0 && s.invalidations / s.sets > CHURN_RATIO) {
         out.push({
-          namespace: stat.namespace,
-          kind: 'promote-to-l1',
-          reason: `Only ${l1} of ${stat.hits} hits came from L1 — raise the L1 size or promotion TTL.`,
-          impact: 40,
+          namespace: s.namespace,
+          severity: "warning",
+          code: "invalidation-churn",
+          message:
+            `${s.namespace} is invalidated ${s.invalidations} times against ` +
+            `${s.sets} writes. The dependency tags are too broad — entries are ` +
+            "dropped before they are read.",
+        });
+      }
+
+      if (s.sets > MIN_SAMPLES && total === s.misses) {
+        out.push({
+          namespace: s.namespace,
+          severity: "info",
+          code: "unused-namespace",
+          message: `${s.namespace} is written ${s.sets} times and never read back.`,
         });
       }
     }
 
-    return out.sort((a, b) => b.impact - a.impact);
+    return out;
   }
 
   reset(): void {
     this.stats.clear();
   }
 }
+
+export const cacheAnalytics = new CacheAnalyticsService();

@@ -1,73 +1,145 @@
 /**
- * Event sourcing and CQRS projections (issue #861).
+ * Event sourcing and CQRS (issue #861).
  *
- * `event-store.service.ts` already persists events. This adds the layer above
- * it: rebuilding state by folding an event stream, and keeping read-side
- * projections in step with the write side.
+ * `event-store.service.ts` already persists domain events. This is the layer
+ * above it: the command side that turns an intent into events, and the query
+ * side that keeps read models current.
  *
- * The store is injected through a narrow interface, so the folding,
- * versioning and optimistic-concurrency logic is unit-testable against an
- * in-memory store — and that logic is where event sourcing actually goes
- * wrong (a lost update, a projection silently drifting from its stream).
+ *   command → aggregate decides → events appended (optimistic concurrency)
+ *           → projections updated → events published to Kafka
+ *
+ * Appending before publishing is deliberate. If the publish fails, the events
+ * are still durable and can be republished; publishing first would risk
+ * broadcasting a state change that was never committed.
+ *
+ * The journal is an interface so the command side can be unit-tested without a
+ * database, and so `EventStoreService` stays the single writer in production.
  */
 
-export interface DomainEvent<T = unknown> {
-  /** Stream this belongs to, e.g. `mentor-42`. */
-  streamId: string;
-  /** Discriminator, e.g. `MentorProfileUpdated`. */
-  type: string;
-  /** Position within the stream, starting at 1. */
+import { Logger } from "../utils/logger";
+import type {
+  KafkaProducerService,
+  OutboundMessage,
+} from "./kafka-producer.service";
+
+const logger = new Logger("EventSourcing");
+
+export interface StoredEvent<T = Record<string, unknown>> {
+  aggregateId: string;
+  aggregateType: string;
+  eventType: string;
+  /** 1-based, contiguous per aggregate. */
   version: number;
-  payload: T;
-  /** Epoch ms the event occurred. */
-  occurredAt: number;
-  metadata?: Record<string, unknown>;
+  data: T;
+  occurredAt: string;
+  correlationId?: string;
 }
 
-export interface AppendResult {
-  streamId: string;
-  /** Version after appending. */
-  version: number;
-  appended: number;
+export type NewEvent<T = Record<string, unknown>> = Pick<
+  StoredEvent<T>,
+  "eventType" | "data"
+>;
+
+/** Persistence for an aggregate's event stream. */
+export interface EventJournal {
+  /** Events for an aggregate, ascending by version. */
+  read(aggregateId: string): Promise<StoredEvent[]>;
+  /**
+   * Append events. Must reject when the stream has moved past
+   * `expectedVersion`, so two concurrent commands cannot both win.
+   */
+  append(
+    aggregateId: string,
+    aggregateType: string,
+    expectedVersion: number,
+    events: NewEvent[],
+    correlationId: string,
+  ): Promise<StoredEvent[]>;
 }
 
-/** Narrow persistence contract — deliberately smaller than the full store. */
-export interface EventStoreAdapter {
-  read(streamId: string, fromVersion?: number): Promise<DomainEvent[]>;
-  append(streamId: string, events: DomainEvent[]): Promise<void>;
-  lastVersion(streamId: string): Promise<number>;
-}
-
-/** Thrown when an append races another writer. */
 export class ConcurrencyError extends Error {
   constructor(
-    readonly streamId: string,
+    readonly aggregateId: string,
     readonly expectedVersion: number,
     readonly actualVersion: number,
   ) {
     super(
-      `Concurrency conflict on "${streamId}": expected version ${expectedVersion}, found ${actualVersion}`,
+      `aggregate ${aggregateId} is at version ${actualVersion}, command expected ${expectedVersion}`,
     );
-    this.name = 'ConcurrencyError';
+    this.name = "ConcurrencyError";
   }
 }
 
-/** In-memory adapter for tests and local development. */
-export class InMemoryEventStore implements EventStoreAdapter {
-  private readonly streams = new Map<string, DomainEvent[]>();
+/** Folds an event stream into current state and decides on commands. */
+export interface Aggregate<S, C> {
+  type: string;
+  /** State for an aggregate with no events yet. */
+  initial: () => S;
+  /** Fold one event into state. Must be pure. */
+  apply: (state: S, event: StoredEvent) => S;
+  /**
+   * Decide which events a command produces. Returning an empty array is a
+   * valid no-op — a command that changes nothing must not bump the version.
+   */
+  decide: (state: S, command: C) => NewEvent[];
+}
 
-  async read(streamId: string, fromVersion = 0): Promise<DomainEvent[]> {
-    return (this.streams.get(streamId) ?? []).filter((e) => e.version > fromVersion);
+/** Read-model updater. Runs after events are durable. */
+export interface Projection {
+  name: string;
+  /** Event types this reacts to. Empty means all. */
+  eventTypes: string[];
+  handle: (event: StoredEvent) => Promise<void> | void;
+}
+
+export interface CommandResult<S> {
+  aggregateId: string;
+  events: StoredEvent[];
+  state: S;
+  version: number;
+}
+
+export interface EventSourcingOptions {
+  journal: EventJournal;
+  producer?: KafkaProducerService;
+  /** Topic events are published to. Omit to skip publishing. */
+  topic?: string;
+}
+
+/** In-memory journal. Backs unit tests and local development. */
+export class InMemoryEventJournal implements EventJournal {
+  private streams = new Map<string, StoredEvent[]>();
+
+  async read(aggregateId: string): Promise<StoredEvent[]> {
+    return [...(this.streams.get(aggregateId) ?? [])];
   }
 
-  async append(streamId: string, events: DomainEvent[]): Promise<void> {
-    const existing = this.streams.get(streamId) ?? [];
-    this.streams.set(streamId, [...existing, ...events]);
-  }
+  async append(
+    aggregateId: string,
+    aggregateType: string,
+    expectedVersion: number,
+    events: NewEvent[],
+    correlationId: string,
+  ): Promise<StoredEvent[]> {
+    const stream = this.streams.get(aggregateId) ?? [];
+    const actualVersion = stream.length;
 
-  async lastVersion(streamId: string): Promise<number> {
-    const events = this.streams.get(streamId) ?? [];
-    return events.length === 0 ? 0 : events[events.length - 1].version;
+    if (actualVersion !== expectedVersion) {
+      throw new ConcurrencyError(aggregateId, expectedVersion, actualVersion);
+    }
+
+    const appended = events.map((event, index) => ({
+      aggregateId,
+      aggregateType,
+      eventType: event.eventType,
+      version: expectedVersion + index + 1,
+      data: event.data,
+      occurredAt: new Date().toISOString(),
+      correlationId,
+    }));
+
+    this.streams.set(aggregateId, [...stream, ...appended]);
+    return appended;
   }
 
   clear(): void {
@@ -75,171 +147,140 @@ export class InMemoryEventStore implements EventStoreAdapter {
   }
 }
 
-/** Folds a stream into read-model state. */
-export interface Projection<S> {
-  name: string;
-  initial: () => S;
-  /**
-   * Apply one event. Must be pure and total: an unknown type returns the
-   * state unchanged rather than throwing, so adding a new event type does not
-   * break every existing projection on replay.
-   */
-  apply: (state: S, event: DomainEvent) => S;
-}
-
-export interface ProjectionState<S> {
-  state: S;
-  /** Stream version this state reflects. */
-  version: number;
-}
-
 export class EventSourcingService {
-  constructor(private readonly store: EventStoreAdapter) {}
+  private projections: Projection[] = [];
+
+  constructor(private readonly options: EventSourcingOptions) {}
+
+  registerProjection(projection: Projection): void {
+    this.projections.push(projection);
+  }
+
+  projectionNames(): string[] {
+    return this.projections.map((projection) => projection.name);
+  }
+
+  /** Rebuild an aggregate's current state from its events. */
+  async rehydrate<S, C>(
+    aggregate: Aggregate<S, C>,
+    aggregateId: string,
+  ): Promise<{ state: S; version: number }> {
+    const events = await this.options.journal.read(aggregateId);
+    const state = events.reduce(
+      (acc, event) => aggregate.apply(acc, event),
+      aggregate.initial(),
+    );
+    return { state, version: events.length };
+  }
 
   /**
-   * Append events with optimistic concurrency.
+   * Execute a command against an aggregate.
    *
-   * `expectedVersion` is the version the caller believed it was writing on top
-   * of. If the stream has moved on, the append is rejected rather than
-   * silently interleaved — the whole point of a version check is that a lost
-   * update is loud instead of invisible.
-   *
-   * Pass `-1` to append unconditionally.
+   * Rehydrates, decides, appends under the version it read, then projects and
+   * publishes. A `ConcurrencyError` propagates so the caller can retry the whole
+   * command against fresh state — retrying the append alone would apply a
+   * decision made from state that no longer holds.
    */
-  async append<T>(
-    streamId: string,
-    events: Array<Omit<DomainEvent<T>, 'streamId' | 'version'>>,
-    expectedVersion = -1,
-  ): Promise<AppendResult> {
-    if (events.length === 0) {
-      return { streamId, version: await this.store.lastVersion(streamId), appended: 0 };
+  async execute<S, C>(
+    aggregate: Aggregate<S, C>,
+    aggregateId: string,
+    command: C,
+    correlationId = `cmd-${Date.now()}`,
+  ): Promise<CommandResult<S>> {
+    const { state, version } = await this.rehydrate(aggregate, aggregateId);
+    const decided = aggregate.decide(state, command);
+
+    if (decided.length === 0) {
+      return { aggregateId, events: [], state, version };
     }
 
-    const current = await this.store.lastVersion(streamId);
-    if (expectedVersion !== -1 && current !== expectedVersion) {
-      throw new ConcurrencyError(streamId, expectedVersion, current);
-    }
+    const appended = await this.options.journal.append(
+      aggregateId,
+      aggregate.type,
+      version,
+      decided,
+      correlationId,
+    );
 
-    const numbered: DomainEvent[] = events.map((e, i) => ({
-      ...e,
-      streamId,
-      version: current + i + 1,
-    }));
+    const nextState = appended.reduce(
+      (acc, event) => aggregate.apply(acc, event),
+      state,
+    );
 
-    await this.store.append(streamId, numbered);
+    await this.project(appended);
+    await this.publish(appended, correlationId);
 
     return {
-      streamId,
-      version: current + numbered.length,
-      appended: numbered.length,
+      aggregateId,
+      events: appended,
+      state: nextState,
+      version: version + appended.length,
     };
   }
 
-  /** Rebuild state by folding the whole stream. */
-  async project<S>(
-    streamId: string,
-    projection: Projection<S>,
-  ): Promise<ProjectionState<S>> {
-    const events = await this.store.read(streamId);
-    return this.foldEvents(events, projection);
-  }
-
   /**
-   * Advance an existing projection with only the events after `fromVersion`.
+   * Run every matching projection.
    *
-   * Full replay is correct but gets linearly slower forever; incremental
-   * catch-up is what keeps a long-lived stream usable.
+   * A projection that throws is logged and skipped: read models are rebuildable
+   * from the journal, so a broken one must not fail a command whose events are
+   * already durable.
    */
-  async projectFrom<S>(
-    streamId: string,
-    projection: Projection<S>,
-    previous: ProjectionState<S>,
-  ): Promise<ProjectionState<S>> {
-    const events = await this.store.read(streamId, previous.version);
-    if (events.length === 0) return previous;
-
-    let state = previous.state;
-    let version = previous.version;
+  private async project(events: StoredEvent[]): Promise<void> {
     for (const event of events) {
-      state = projection.apply(state, event);
-      version = event.version;
+      for (const projection of this.projections) {
+        if (
+          projection.eventTypes.length &&
+          !projection.eventTypes.includes(event.eventType)
+        ) {
+          continue;
+        }
+        try {
+          await projection.handle(event);
+        } catch (err) {
+          logger.error(
+            `Projection ${projection.name} failed on ${event.eventType} ` +
+              `v${event.version} of ${event.aggregateId}: ${(err as Error).message}`,
+          );
+        }
+      }
     }
-    return { state, version };
   }
 
-  /** Fold an in-memory event list — used by both project paths. */
-  foldEvents<S>(events: DomainEvent[], projection: Projection<S>): ProjectionState<S> {
-    let state = projection.initial();
-    let version = 0;
+  /** Publish durable events. Failures are logged; the events remain replayable. */
+  private async publish(
+    events: StoredEvent[],
+    correlationId: string,
+  ): Promise<void> {
+    const { producer, topic } = this.options;
+    if (!producer || !topic) return;
 
-    // Sort defensively: a store that returns out of order would otherwise
-    // produce a state that depends on retrieval order rather than on the
-    // events themselves.
-    const ordered = [...events].sort((a, b) => a.version - b.version);
-    for (const event of ordered) {
-      state = projection.apply(state, event);
-      version = event.version;
+    const messages: OutboundMessage[] = events.map((event) => ({
+      topic,
+      key: event.aggregateId,
+      eventType: event.eventType,
+      payload: event.data,
+      correlationId,
+    }));
+
+    try {
+      await producer.publishBatch(messages);
+    } catch (err) {
+      logger.error(
+        `Publishing ${events.length} event(s) for ${events[0]?.aggregateId} failed; ` +
+          `they are durable and can be replayed: ${(err as Error).message}`,
+      );
     }
-
-    return { state, version };
   }
 
   /**
-   * State as of a point in time — the audit question event sourcing exists to
-   * answer ("what did this look like when the dispute was raised?").
+   * Replay an aggregate's events through the projections.
+   *
+   * This is how a read model is rebuilt after a schema change or after the
+   * projection failure above.
    */
-  async projectAsOf<S>(
-    streamId: string,
-    projection: Projection<S>,
-    asOf: number,
-  ): Promise<ProjectionState<S>> {
-    const events = await this.store.read(streamId);
-    return this.foldEvents(
-      events.filter((e) => e.occurredAt <= asOf),
-      projection,
-    );
-  }
-
-  async currentVersion(streamId: string): Promise<number> {
-    return this.store.lastVersion(streamId);
-  }
-}
-
-/**
- * CQRS command/query separation.
- *
- * Commands go to the write side and return the resulting version; queries read
- * a projection. Keeping them apart in the type system is what stops a "query"
- * quietly acquiring a write six months later.
- */
-export interface CommandResult {
-  streamId: string;
-  version: number;
-  events: number;
-}
-
-export class CommandBus {
-  private readonly handlers = new Map<
-    string,
-    (payload: unknown) => Promise<CommandResult>
-  >();
-
-  register<P>(
-    commandType: string,
-    handler: (payload: P) => Promise<CommandResult>,
-  ): void {
-    this.handlers.set(commandType, handler as (p: unknown) => Promise<CommandResult>);
-  }
-
-  async dispatch<P>(commandType: string, payload: P): Promise<CommandResult> {
-    const handler = this.handlers.get(commandType);
-    if (!handler) {
-      throw new Error(`No handler registered for command "${commandType}"`);
-    }
-    return handler(payload);
-  }
-
-  registeredCommands(): string[] {
-    return [...this.handlers.keys()];
+  async replay(aggregateId: string): Promise<number> {
+    const events = await this.options.journal.read(aggregateId);
+    await this.project(events);
+    return events.length;
   }
 }

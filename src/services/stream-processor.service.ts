@@ -1,272 +1,243 @@
 /**
- * Stream processing pipeline (issue #861).
+ * Stream processing for real-time analytics (issue #861).
  *
- * Windowed aggregation, ordering and error handling for a message stream —
- * the parts of "stream processing" that carry real logic, expressed against a
- * transport-agnostic `StreamMessage` rather than a Kafka record.
+ * A small topology over the consumer's event stream: filter, map, and tumbling
+ * windowed aggregation, feeding sinks that update live dashboards.
  *
- * That indirection is the point: tumbling-window boundaries, late-arrival
- * handling and retry/DLQ routing are where stream processors are actually
- * wrong, and none of it needs a broker to test. The Kafka adapters
- * (`kafka-producer.service.ts`, `kafka-consumer.service.ts`) translate records
- * into this shape and back.
- *
- * ─── Verification status ────────────────────────────────────────────────────
- * Everything in this file is unit-tested. The Kafka transport is not: there is
- * no broker in CI and no `kafkajs` dependency in `package.json`, so the
- * adapters are written against an injectable client interface and left for
- * whoever provisions the cluster.
+ * Windows close on event time, not wall-clock time, so a delayed batch produces
+ * the same numbers as a timely one — which is the whole point of doing this on
+ * a log rather than on request timing. Events later than `allowedLatenessMs`
+ * past a closed window are counted as late and dropped rather than silently
+ * corrupting a window that was already emitted.
  */
 
-export interface StreamMessage<T = unknown> {
-  /** Logical stream name — a Kafka topic, a Redis stream, anything. */
-  topic: string;
-  /** Ordering/partitioning key. Messages sharing a key keep relative order. */
-  key: string | null;
-  value: T;
-  /** Event time in epoch ms — when it *happened*, not when it arrived. */
-  timestamp: number;
-  /** Monotonic position within the partition, when the transport has one. */
-  offset?: number;
-  headers?: Record<string, string>;
-}
+import { Logger } from "../utils/logger";
+import type { EventEnvelope } from "./kafka-producer.service";
 
-export interface WindowedResult<R> {
-  /** Inclusive window start, epoch ms. */
+const logger = new Logger("StreamProcessor");
+
+export type Predicate = (event: EventEnvelope) => boolean;
+export type Mapper<T> = (event: EventEnvelope) => T;
+
+export interface WindowedResult<T = unknown> {
+  /** Inclusive start of the window, epoch milliseconds. */
   windowStart: number;
-  /** Exclusive window end, epoch ms. */
+  /** Exclusive end. */
   windowEnd: number;
-  key: string | null;
-  result: R;
-  messageCount: number;
+  key: string;
+  count: number;
+  value: T;
 }
 
-/**
- * Align a timestamp to the start of its tumbling window.
- *
- * Floor-based so windows are stable across restarts: deriving them from
- * "first message seen" would give a different grid every deploy, and two
- * replicas would disagree about which window a message belongs to.
- */
-export function windowStartFor(timestamp: number, windowMs: number): number {
-  if (windowMs <= 0) return timestamp;
-  return Math.floor(timestamp / windowMs) * windowMs;
+export type Aggregator<S, T> = {
+  /** Initial state for a new window+key. */
+  init: () => S;
+  /** Fold one event into the state. */
+  step: (state: S, event: EventEnvelope) => S;
+  /** Finalise the state into the emitted value. */
+  done: (state: S) => T;
+};
+
+export interface WindowSpec<S = unknown, T = unknown> {
+  name: string;
+  /** Window width in milliseconds. */
+  sizeMs: number;
+  /** Grouping key. Defaults to the envelope key. */
+  keyBy?: (event: EventEnvelope) => string;
+  /** How late an event may arrive and still be counted. */
+  allowedLatenessMs?: number;
+  aggregator: Aggregator<S, T>;
+  /** Called once per window+key when the window closes. */
+  sink: (result: WindowedResult<T>) => Promise<void> | void;
 }
 
-export interface WindowAggregatorOptions<T, R> {
-  windowMs: number;
-  /** Seed for a new window. */
-  initial: () => R;
-  /** Fold a message into the accumulator. */
-  reduce: (acc: R, message: StreamMessage<T>) => R;
-  /**
-   * Grace period for late arrivals, ms.
-   *
-   * Event time rarely equals arrival time — a mobile client reconnecting can
-   * deliver events minutes late. Without grace they land in the wrong window
-   * or are dropped; with too much, results are never final.
-   */
-  graceMs?: number;
-  /** Emitted when a window closes. */
-  onWindowClosed?: (result: WindowedResult<R>) => void;
-  /** Called for a message too late even for the grace period. */
-  onLateMessage?: (message: StreamMessage<T>, windowStart: number) => void;
+export interface ProcessorStats {
+  consumed: number;
+  filtered: number;
+  late: number;
+  windowsEmitted: number;
 }
 
-interface OpenWindow<R> {
+export const DEFAULT_ALLOWED_LATENESS_MS = 30_000;
+
+/** Start of the tumbling window an event time falls into. */
+export function windowStartFor(timestampMs: number, sizeMs: number): number {
+  return Math.floor(timestampMs / sizeMs) * sizeMs;
+}
+
+interface OpenWindow<S> {
+  key: string;
   windowStart: number;
-  key: string | null;
-  acc: R;
+  state: S;
   count: number;
 }
 
-/**
- * Tumbling-window aggregator, keyed by message key.
- *
- * Windows close on watermark advance rather than a wall clock, so replaying
- * history produces exactly the same output as processing it live — the
- * property that makes a stream job debuggable at all.
- */
-export class WindowAggregator<T, R> {
-  private readonly windows = new Map<string, OpenWindow<R>>();
-  private watermark = Number.NEGATIVE_INFINITY;
-  private readonly windowMs: number;
-  private readonly graceMs: number;
-  private readonly initial: () => R;
-  private readonly reduce: (acc: R, message: StreamMessage<T>) => R;
-  private readonly onWindowClosed?: (result: WindowedResult<R>) => void;
-  private readonly onLateMessage?: (m: StreamMessage<T>, windowStart: number) => void;
+export class StreamProcessorService {
+  private filters: Predicate[] = [];
+  private windows: Array<WindowSpec<any, any>> = [];
+  private open = new Map<string, OpenWindow<any>>();
+  /** Latest event time seen, which drives window closing. */
+  private watermark = 0;
+  private stats: ProcessorStats = {
+    consumed: 0,
+    filtered: 0,
+    late: 0,
+    windowsEmitted: 0,
+  };
 
-  constructor(options: WindowAggregatorOptions<T, R>) {
-    this.windowMs = Math.max(1, options.windowMs);
-    this.graceMs = Math.max(0, options.graceMs ?? 0);
-    this.initial = options.initial;
-    this.reduce = options.reduce;
-    this.onWindowClosed = options.onWindowClosed;
-    this.onLateMessage = options.onLateMessage;
+  /** Drop events that fail the predicate before any window sees them. */
+  filter(predicate: Predicate): this {
+    this.filters.push(predicate);
+    return this;
+  }
+
+  /** Register a tumbling window aggregation. */
+  window<S, T>(spec: WindowSpec<S, T>): this {
+    this.windows.push(spec);
+    return this;
+  }
+
+  getStats(): ProcessorStats {
+    return { ...this.stats };
   }
 
   /**
-   * Slot id for a (key, window) pair.
+   * Feed one event through the topology.
    *
-   * A null key is encoded with a distinct prefix rather than stringified, so a
-   * message with the literal key "null" cannot collide with an unkeyed one and
-   * silently merge two different aggregates.
+   * Advancing the watermark may close windows, so a sink can fire as a side
+   * effect of ingesting an unrelated event — that is how a tumbling window
+   * emits without a timer.
    */
-  private slot(key: string | null, windowStart: number): string {
-    const encoded = key === null ? 'n:' : `k:${key}`;
-    return `${encoded}::${windowStart}`;
-  }
+  async process(event: EventEnvelope): Promise<void> {
+    this.stats.consumed++;
 
-  /**
-   * Ingest one message.
-   *
-   * @returns `true` if it was aggregated, `false` if dropped as too late.
-   */
-  add(message: StreamMessage<T>): boolean {
-    const windowStart = windowStartFor(message.timestamp, this.windowMs);
-    const windowEnd = windowStart + this.windowMs;
-
-    // Too late even for grace: the window has already been emitted, and
-    // reopening it would produce a second, contradictory result downstream.
-    if (windowEnd + this.graceMs <= this.watermark) {
-      this.onLateMessage?.(message, windowStart);
-      return false;
+    if (!this.filters.every((predicate) => predicate(event))) {
+      this.stats.filtered++;
+      return;
     }
 
-    const slot = this.slot(message.key, windowStart);
-    let window = this.windows.get(slot);
-    if (!window) {
-      window = {
-        windowStart,
-        key: message.key,
-        acc: this.initial(),
+    const eventTime = Date.parse(event.occurredAt);
+    if (Number.isNaN(eventTime)) {
+      this.stats.late++;
+      return;
+    }
+
+    if (eventTime > this.watermark) this.watermark = eventTime;
+
+    for (const spec of this.windows) {
+      const lateness = spec.allowedLatenessMs ?? DEFAULT_ALLOWED_LATENESS_MS;
+      const start = windowStartFor(eventTime, spec.sizeMs);
+
+      // The window this event belongs to is already closed and emitted.
+      if (start + spec.sizeMs + lateness <= this.watermark) {
+        this.stats.late++;
+        continue;
+      }
+
+      const key = (spec.keyBy ?? ((e: EventEnvelope) => e.key))(event);
+      const id = `${spec.name}|${key}|${start}`;
+      const existing = this.open.get(id);
+      const window: OpenWindow<unknown> = existing ?? {
+        key,
+        windowStart: start,
+        state: spec.aggregator.init(),
         count: 0,
       };
-      this.windows.set(slot, window);
+
+      window.state = spec.aggregator.step(window.state, event);
+      window.count++;
+      this.open.set(id, window);
     }
 
-    window.acc = this.reduce(window.acc, message);
-    window.count += 1;
-
-    // The watermark only ever moves forward — out-of-order arrivals must not
-    // drag it back and re-open closed windows.
-    if (message.timestamp > this.watermark) {
-      this.watermark = message.timestamp;
-      this.closeExpired();
-    }
-
-    return true;
+    await this.closeExpired();
   }
 
-  private closeExpired(): void {
-    for (const [slot, window] of this.windows) {
-      const windowEnd = window.windowStart + this.windowMs;
-      if (windowEnd + this.graceMs <= this.watermark) {
-        this.emit(slot, window);
+  /** Emit every window whose end plus lateness is behind the watermark. */
+  private async closeExpired(): Promise<void> {
+    for (const [id, window] of [...this.open]) {
+      const specName = id.split("|")[0];
+      const spec = this.windows.find(
+        (candidate) => candidate.name === specName,
+      );
+      if (!spec) {
+        this.open.delete(id);
+        continue;
+      }
+
+      const lateness = spec.allowedLatenessMs ?? DEFAULT_ALLOWED_LATENESS_MS;
+      if (window.windowStart + spec.sizeMs + lateness > this.watermark)
+        continue;
+
+      this.open.delete(id);
+      const result: WindowedResult = {
+        windowStart: window.windowStart,
+        windowEnd: window.windowStart + spec.sizeMs,
+        key: window.key,
+        count: window.count,
+        value: spec.aggregator.done(window.state),
+      };
+
+      try {
+        await spec.sink(result);
+        this.stats.windowsEmitted++;
+      } catch (err) {
+        // A failing dashboard write must not stall the stream.
+        logger.warn(`Sink for ${spec.name} failed: ${(err as Error).message}`);
       }
     }
   }
 
-  private emit(slot: string, window: OpenWindow<R>): void {
-    this.windows.delete(slot);
-    this.onWindowClosed?.({
-      windowStart: window.windowStart,
-      windowEnd: window.windowStart + this.windowMs,
-      key: window.key,
-      result: window.acc,
-      messageCount: window.count,
-    });
+  /**
+   * Emit every open window regardless of the watermark.
+   *
+   * Call on shutdown, so the last partial window reaches the dashboard instead
+   * of being lost.
+   */
+  async flush(): Promise<void> {
+    this.watermark = Number.MAX_SAFE_INTEGER;
+    await this.closeExpired();
   }
 
-  /** Force every open window closed — call at shutdown so nothing is lost. */
-  flush(): void {
-    for (const [slot, window] of [...this.windows]) {
-      this.emit(slot, window);
-    }
-  }
-
-  openWindowCount(): number {
-    return this.windows.size;
-  }
-
-  currentWatermark(): number {
-    return this.watermark;
+  reset(): void {
+    this.open.clear();
+    this.watermark = 0;
+    this.stats = { consumed: 0, filtered: 0, late: 0, windowsEmitted: 0 };
   }
 }
 
-export interface ProcessingResult {
-  processed: number;
-  failed: number;
-  retried: number;
-  deadLettered: number;
+// ─── Aggregators ─────────────────────────────────────────────────────────────
+
+export const countAggregator: Aggregator<number, number> = {
+  init: () => 0,
+  step: (state) => state + 1,
+  done: (state) => state,
+};
+
+/** Sum a numeric field off the payload, ignoring events where it is absent. */
+export function sumAggregator(field: string): Aggregator<number, number> {
+  return {
+    init: () => 0,
+    step: (state, event) => {
+      const value = (event.payload as Record<string, unknown> | null)?.[field];
+      return typeof value === "number" && Number.isFinite(value)
+        ? state + value
+        : state;
+    },
+    done: (state) => state,
+  };
 }
 
-export interface ProcessorOptions<T> {
-  handler: (message: StreamMessage<T>) => Promise<void>;
-  /** Attempts per message before it is dead-lettered. */
-  maxAttempts?: number;
-  /** Receives messages that exhausted every attempt. */
-  onDeadLetter?: (message: StreamMessage<T>, error: Error) => Promise<void> | void;
-  onError?: (message: StreamMessage<T>, error: Error, attempt: number) => void;
-}
-
-/**
- * Run a handler over a batch with bounded retries and a dead-letter path.
- *
- * A poison message — one that will never succeed — must not block the
- * partition behind it forever. After `maxAttempts` it is routed aside and
- * processing continues, which is the difference between one lost message and a
- * stalled consumer group.
- */
-export class StreamProcessor<T> {
-  private readonly handler: (message: StreamMessage<T>) => Promise<void>;
-  private readonly maxAttempts: number;
-  private readonly onDeadLetter?: (m: StreamMessage<T>, e: Error) => Promise<void> | void;
-  private readonly onError?: (m: StreamMessage<T>, e: Error, attempt: number) => void;
-
-  constructor({ handler, maxAttempts = 3, onDeadLetter, onError }: ProcessorOptions<T>) {
-    this.handler = handler;
-    this.maxAttempts = Math.max(1, maxAttempts);
-    this.onDeadLetter = onDeadLetter;
-    this.onError = onError;
-  }
-
-  async processBatch(messages: StreamMessage<T>[]): Promise<ProcessingResult> {
-    const result: ProcessingResult = {
-      processed: 0,
-      failed: 0,
-      retried: 0,
-      deadLettered: 0,
-    };
-
-    // Sequential on purpose: messages sharing a key must keep their relative
-    // order, and a batch from one partition is already ordered.
-    for (const message of messages) {
-      let lastError: Error | null = null;
-
-      for (let attempt = 1; attempt <= this.maxAttempts; attempt += 1) {
-        try {
-          await this.handler(message);
-          result.processed += 1;
-          lastError = null;
-          break;
-        } catch (error) {
-          lastError = error instanceof Error ? error : new Error(String(error));
-          this.onError?.(message, lastError, attempt);
-          if (attempt < this.maxAttempts) result.retried += 1;
-        }
-      }
-
-      if (lastError) {
-        result.failed += 1;
-        if (this.onDeadLetter) {
-          await this.onDeadLetter(message, lastError);
-          result.deadLettered += 1;
-        }
-      }
-    }
-
-    return result;
-  }
+/** Distinct count over a payload field. */
+export function distinctAggregator(
+  field: string,
+): Aggregator<Set<string>, number> {
+  return {
+    init: () => new Set<string>(),
+    step: (state, event) => {
+      const value = (event.payload as Record<string, unknown> | null)?.[field];
+      if (value !== undefined && value !== null) state.add(String(value));
+      return state;
+    },
+    done: (state) => state.size,
+  };
 }

@@ -1,192 +1,201 @@
 /**
- * Intelligent response cache middleware (issue #864).
+ * Response caching driven by the cache orchestrator (issue #864).
  *
- * Sits in front of a handler and serves a cached response when one is
- * available, using the multi-layer `CacheOrchestrator` underneath.
+ * `cacheMiddleware` caches a response body in Redis under the request URL. This
+ * middleware adds the parts that need the tier hierarchy:
  *
- * The existing `cache.middleware.ts` caches by URL. The decisions that make a
- * response cache *correct* rather than merely fast are the ones extracted here
- * as pure functions: whether a request is even eligible, what the key varies
- * on, and whether a response is safe to store. Each of those, done wrong, is a
- * data-leak or a stale-forever bug rather than a slow page.
+ *   - L1 hits, so a hot endpoint never leaves the process
+ *   - dependency tags, so a mentor update drops every response mentioning them
+ *   - stale-while-revalidate, so an expiring key does not stall a request
+ *
+ * Private responses are still scoped to the caller by an HMAC of the user id,
+ * reusing `signUserId` so both middlewares derive the same identity.
  */
 
-import type { Request, Response, NextFunction } from 'express';
-import type { CacheOrchestrator } from '../services/cache-orchestrator.service';
+import { Request, Response, NextFunction } from "express";
+import crypto from "crypto";
+import {
+  cacheOrchestrator,
+  CacheOrchestrator,
+  CacheTier,
+} from "../services/cache-orchestrator.service";
+import { signUserId } from "./cache.middleware";
 
 export interface CachedResponse {
   status: number;
   body: unknown;
-  /** Only the headers worth replaying — not the whole set. */
+  /** Response headers replayed on a hit. */
   headers: Record<string, string>;
-  /** Epoch ms the entry was stored, used for an Age header. */
-  storedAt: number;
 }
 
 export interface IntelligentCacheOptions {
-  orchestrator: CacheOrchestrator;
-  ttlSeconds?: number;
-  /** Namespace prefix for keys. */
-  namespace?: string;
-  /** Extra request headers the key should vary on, e.g. `accept-language`. */
-  varyHeaders?: string[];
+  /** Cache namespace; becomes the key prefix and the analytics grouping. */
+  namespace: string;
+  ttl?: number;
   /**
-   * Entities this route's response derives from, for dependency-tracked
-   * invalidation. Receives the request so it can include path params.
+   * Dependency tags for the response. Given the request so a tag can name the
+   * specific entity, e.g. `req => ['mentor:' + req.params.id]`.
    */
-  dependsOn?: (req: Request) => string[];
-  /** Override eligibility, e.g. to cache a specific authenticated route. */
-  isEligible?: (req: Request) => boolean;
+  dependencies?: (req: Request) => string[];
+  /** Request headers folded into the key, e.g. `['accept-language']`. */
+  vary?: string[];
+  /** Cache responses for authenticated callers, scoped to the caller. */
+  cacheAuthenticated?: boolean;
+  /** Serve an expired entry while refreshing behind the request. */
+  staleWhileRevalidate?: boolean;
+  /** Tiers to write to. Defaults to L1 + L2. */
+  tiers?: CacheTier[];
+  /** Skip caching for a specific request. */
+  skip?: (req: Request) => boolean;
+  orchestrator?: CacheOrchestrator;
 }
 
-/** Headers replayed from a cached response. */
-const REPLAYABLE_HEADERS = ['content-type', 'content-language', 'etag'];
+/** Headers worth replaying; anything hop-by-hop or connection-specific is not. */
+const REPLAYED_HEADERS = ["content-type", "content-language", "etag"];
 
-/**
- * Whether a request may be served from cache.
- *
- * Authenticated requests are excluded by default. Caching a response produced
- * for one user and serving it to another is the single worst bug a response
- * cache can have, so it is opt-in per route rather than something a
- * `varyHeaders` misconfiguration can switch on by accident.
- */
-export function isCacheableRequest(req: Request): boolean {
-  if (req.method !== 'GET' && req.method !== 'HEAD') return false;
-
-  // An explicit no-cache from the client is a request to revalidate.
-  const cacheControl = String(req.headers['cache-control'] ?? '');
-  if (/no-cache|no-store/i.test(cacheControl)) return false;
-
-  if (req.headers.authorization) return false;
-  if (req.headers.cookie) return false;
-
-  return true;
-}
-
-/**
- * Whether a response may be stored.
- *
- * Only 200 and 204: a 404 or 500 cached for even a minute turns a transient
- * fault into a sticky one, and a 3xx cached against the wrong key sends users
- * somewhere they did not ask to go.
- */
-export function isCacheableResponse(
-  status: number,
-  headers: Record<string, unknown>,
-): boolean {
-  if (status !== 200 && status !== 204) return false;
-
-  const cacheControl = String(headers['cache-control'] ?? '');
-  if (/no-store|private/i.test(cacheControl)) return false;
-
-  // A response that set a cookie is user-specific almost by definition.
-  if (headers['set-cookie']) return false;
-
-  return true;
-}
-
-/**
- * Build the cache key.
- *
- * Query parameters are sorted so `?a=1&b=2` and `?b=2&a=1` share an entry —
- * otherwise the cache fragments into near-duplicates and the hit rate quietly
- * collapses.
- *
- * Every header named in `varyHeaders` is folded in. Omitting one that changes
- * the response is how a cache serves German content to an English speaker.
- */
 export function buildCacheKey(
   req: Request,
-  namespace: string,
-  varyHeaders: string[] = [],
+  options: IntelligentCacheOptions,
 ): string {
-  const url = new URL(req.originalUrl ?? req.url ?? '/', 'http://internal');
-  const params = [...url.searchParams.entries()].sort(([a], [b]) => a.localeCompare(b));
-  const query = params.map(([k, v]) => `${k}=${v}`).join('&');
+  const parts = [req.originalUrl];
 
-  const vary = varyHeaders
-    .map((h) => `${h}=${String(req.headers[h.toLowerCase()] ?? '')}`)
-    .join('|');
+  for (const header of options.vary ?? []) {
+    const value = req.headers[header.toLowerCase()];
+    parts.push(
+      `${header}=${Array.isArray(value) ? value.join(",") : (value ?? "")}`,
+    );
+  }
 
-  return [namespace, req.method, url.pathname, query, vary]
-    .filter((part) => part !== '')
-    .join(':');
+  if (options.cacheAuthenticated) {
+    const user = (req as any).user;
+    const userId = user?.userId ?? user?.id;
+    if (userId) parts.push(`u=${signUserId(String(userId))}`);
+  }
+
+  // The URL can be long and carries user input; hashing keeps keys bounded and
+  // keeps raw query strings out of Redis.
+  const digest = crypto
+    .createHash("sha256")
+    .update(parts.join("|"))
+    .digest("hex")
+    .slice(0, 32);
+  return `${options.namespace}:http:${digest}`;
 }
 
 /**
- * Express middleware factory.
+ * Cache a GET response through the orchestrator.
  *
- * On a hit the cached body is sent directly. On a miss `res.json` is wrapped
- * so the response is captured on its way out, then stored — without requiring
- * every handler to know it is being cached.
+ * @example
+ * router.get(
+ *   '/mentors/:id',
+ *   intelligentCache({
+ *     namespace: 'mentors',
+ *     ttl: 300,
+ *     dependencies: (req) => [`mentor:${req.params.id}`],
+ *     staleWhileRevalidate: true,
+ *   }),
+ *   handler,
+ * );
  */
-export function intelligentCache({
-  orchestrator,
-  ttlSeconds = 60,
-  namespace = 'http',
-  varyHeaders = [],
-  dependsOn,
-  isEligible = isCacheableRequest,
-}: IntelligentCacheOptions) {
-  return async function intelligentCacheMiddleware(
+export function intelligentCache(options: IntelligentCacheOptions) {
+  const orchestrator = options.orchestrator ?? cacheOrchestrator;
+
+  return async (
     req: Request,
     res: Response,
     next: NextFunction,
-  ): Promise<void> {
-    if (!isEligible(req)) {
-      next();
-      return;
-    }
+  ): Promise<void> => {
+    if (req.method !== "GET") return next();
+    if (options.skip?.(req)) return next();
 
-    const key = buildCacheKey(req, namespace, varyHeaders);
+    const isAuthed = !!(req as any).user;
+    if (isAuthed && !options.cacheAuthenticated) return next();
 
+    const key = buildCacheKey(req, options);
+    const dependencies = options.dependencies?.(req) ?? [];
+
+    // The loader rejects rather than resolving, so a miss falls through to the
+    // route handler instead of caching a placeholder.
+    let served = false;
     try {
-      const hit = await orchestrator.get<CachedResponse>(key);
-      if (hit) {
-        for (const [name, value] of Object.entries(hit.headers)) {
+      const result = await orchestrator.get<CachedResponse>(
+        key,
+        () => Promise.reject(new CacheMiss()),
+        {
+          ttl: options.ttl,
+          dependencies,
+          tiers: options.tiers,
+          staleWhileRevalidate: options.staleWhileRevalidate,
+        },
+      );
+
+      if (result.value) {
+        served = true;
+        res.setHeader("X-Cache", result.stale ? "STALE" : "HIT");
+        res.setHeader("X-Cache-Tier", result.tier ?? "unknown");
+        for (const [name, value] of Object.entries(result.value.headers)) {
           res.setHeader(name, value);
         }
-        res.setHeader('X-Cache', 'HIT');
-        res.setHeader('Age', String(Math.floor((Date.now() - hit.storedAt) / 1000)));
-        res.status(hit.status).json(hit.body);
+        res.status(result.value.status).json(result.value.body);
         return;
       }
-    } catch {
-      // A cache read failure must never fail the request — fall through to the
-      // handler, which is the whole point of a cache being an optimisation.
+    } catch (err) {
+      if (!(err instanceof CacheMiss)) {
+        // A cache failure must not fail the request; fall through uncached.
+        res.setHeader("X-Cache", "ERROR");
+      }
     }
 
-    res.setHeader('X-Cache', 'MISS');
+    if (served) return;
+
+    res.setHeader("X-Cache", "MISS");
 
     const originalJson = res.json.bind(res);
-    res.json = ((body: unknown) => {
-      const headers: Record<string, string> = {};
-      for (const name of REPLAYABLE_HEADERS) {
-        const value = res.getHeader(name);
-        if (typeof value === 'string') headers[name] = value;
-      }
+    res.json = (body: unknown) => {
+      if (res.statusCode < 400) {
+        const headers: Record<string, string> = {};
+        for (const name of REPLAYED_HEADERS) {
+          const value = res.getHeader(name);
+          if (typeof value === "string") headers[name] = value;
+        }
 
-      if (isCacheableResponse(res.statusCode, res.getHeaders())) {
-        const entry: CachedResponse = {
-          status: res.statusCode,
-          body,
-          headers,
-          storedAt: Date.now(),
-        };
-
-        // Fire-and-forget: the client should not wait on the cache write, and
-        // a failed write is not a failed request.
         void orchestrator
-          .set(key, entry, {
-            ttlSeconds,
-            dependsOn: dependsOn?.(req),
-          })
-          .catch(() => undefined);
+          .set<CachedResponse>(
+            key,
+            { status: res.statusCode, body, headers },
+            {
+              ttl: options.ttl,
+              dependencies,
+              tiers: options.tiers,
+            },
+          )
+          .catch(() => {
+            /* caching is best-effort */
+          });
       }
-
       return originalJson(body);
-    }) as Response['json'];
+    };
 
     next();
   };
+}
+
+/** Signals "nothing cached" without the loader inventing a value. */
+export class CacheMiss extends Error {
+  constructor() {
+    super("cache miss");
+    this.name = "CacheMiss";
+  }
+}
+
+/**
+ * Invalidate every cached response that declared any of `tags`.
+ *
+ * Call from a write path — after updating a mentor, `invalidateDependencies(['mentor:42'])`.
+ */
+export async function invalidateDependencies(
+  tags: string[],
+  orchestrator: CacheOrchestrator = cacheOrchestrator,
+): Promise<string[]> {
+  return orchestrator.invalidateTags(tags);
 }

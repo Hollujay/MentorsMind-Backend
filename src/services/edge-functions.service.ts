@@ -1,252 +1,252 @@
 /**
- * Edge function registry and routing (issue #863).
+ * Edge function registry and dispatcher (issue #863).
  *
- * Edge functions run at the CDN PoP rather than the origin, so the routing
- * decision — which function handles which request — has to be resolvable
- * without any origin state. That matching logic is pure and lives here, and it
- * is the part worth testing: a route that matches too broadly silently
- * intercepts traffic it was never meant to see.
+ * Edge functions are small, synchronous-ish transforms that run per request:
+ * geo routing, A/B bucketing, header rewriting, redirect rules. Each provider
+ * (CloudFront Functions, Cloudflare Workers, Fastly Compute) has its own
+ * deployment story, so this service owns the parts that are ours:
  *
- * ─── Verification status ────────────────────────────────────────────────────
- * Registration, route matching, precedence and the deployment *manifest* are
- * implemented and unit-tested. Actual deployment to a PoP is behind the
- * `EdgeDeploymentTarget` interface with no concrete implementation: pushing
- * code to Cloudflare Workers, Lambda@Edge or Fastly Compute needs live
- * credentials and a real account, and an unrunnable adapter is worse than an
- * honest seam.
+ *   - a registry of functions with the routes they apply to
+ *   - a dispatcher that runs them in order against a request context
+ *   - a hard timeout, because an edge function that hangs is worse than absent
+ *   - a deployment manifest that a provider-specific step can consume
+ *
+ * Running the same logic here and at the edge means a request served from the
+ * origin behaves the same as one served from a POP.
  */
 
-export type EdgeTrigger =
-  /** Before the CDN checks its cache. */
-  | 'viewer-request'
-  /** After a cache miss, before hitting the origin. */
-  | 'origin-request'
-  /** After the origin responds, before caching. */
-  | 'origin-response'
-  /** Before the response is returned to the client. */
-  | 'viewer-response';
+import { Logger } from "../utils/logger";
+import {
+  cdnConfig,
+  type CDNConfiguration,
+  type CDNProviderName,
+} from "../config/cdn.config";
 
-export interface EdgeFunctionDefinition {
+const logger = new Logger("EdgeFunctions");
+
+export type EdgeTrigger = "viewer-request" | "viewer-response";
+
+export interface EdgeRequestContext {
+  path: string;
+  method: string;
+  headers: Record<string, string>;
+  /** ISO country code resolved by the CDN, when it supplies one. */
+  country?: string;
+  query: Record<string, string>;
+}
+
+export interface EdgeResult {
+  /** Headers to add or overwrite. */
+  headers?: Record<string, string>;
+  /** Rewrite the origin path. */
+  rewritePath?: string;
+  /** Short-circuit with a redirect. Stops the chain. */
+  redirect?: { status: 301 | 302 | 307 | 308; location: string };
+  /** Short-circuit with a response. Stops the chain. */
+  respond?: { status: number; body: string };
+}
+
+export interface EdgeFunction {
   name: string;
   trigger: EdgeTrigger;
-  /**
-   * Path pattern. Supports a single trailing `*` wildcard and `:param`
-   * segments — deliberately not full regex, because a regex in a routing table
-   * is a denial-of-service waiting to happen at the edge.
-   */
-  route: string;
-  /**
-   * Higher wins when two routes match. Explicit rather than relying on
-   * registration order, which is invisible at review time.
-   */
+  /** Path prefixes this applies to. Empty means every path. */
+  routes: string[];
+  /** Lower runs first. */
   priority?: number;
-  /** Memory ceiling in MB, passed through to the platform. */
-  memoryMb?: number;
-  /** Wall-clock budget in ms. Edge platforms enforce single-digit budgets. */
-  timeoutMs?: number;
-  /** Marked inactive without being removed, so a rollback is a flag flip. */
-  enabled?: boolean;
+  handler: (ctx: EdgeRequestContext) => EdgeResult | Promise<EdgeResult>;
 }
 
-export interface EdgeMatch {
-  definition: EdgeFunctionDefinition;
-  /** Values captured from `:param` segments. */
-  params: Record<string, string>;
-}
-
-/** Maximum path segments considered — bounds matching cost on hostile input. */
-const MAX_SEGMENTS = 32;
-
-function segments(path: string): string[] {
-  return path.split('/').filter(Boolean).slice(0, MAX_SEGMENTS);
-}
-
-/**
- * Match a concrete path against a route pattern.
- *
- * Returns captured params, or `null` when it does not match. Exact and
- * `:param` segments must align one-to-one; a trailing `*` absorbs the rest.
- */
-export function matchRoute(
-  pattern: string,
-  path: string,
-): Record<string, string> | null {
-  const patternParts = segments(pattern);
-  const pathParts = segments(path);
-  const params: Record<string, string> = {};
-
-  for (let i = 0; i < patternParts.length; i += 1) {
-    const p = patternParts[i];
-
-    if (p === '*') {
-      // Trailing wildcard absorbs everything left, including nothing.
-      return params;
-    }
-
-    if (i >= pathParts.length) return null;
-
-    if (p.startsWith(':')) {
-      params[p.slice(1)] = decodeURIComponent(pathParts[i]);
-      continue;
-    }
-
-    if (p !== pathParts[i]) return null;
-  }
-
-  // Without a wildcard the lengths must agree, or `/a` would match `/a/b`.
-  return patternParts.length === pathParts.length ? params : null;
-}
-
-/** Specificity score — more literal segments beats more wildcards. */
-export function routeSpecificity(pattern: string): number {
-  let score = 0;
-  for (const part of segments(pattern)) {
-    if (part === '*') score += 0;
-    else if (part.startsWith(':')) score += 1;
-    else score += 2;
-  }
-  return score;
-}
-
-export interface EdgeDeploymentTarget {
-  readonly provider: 'cloudflare' | 'lambda-edge' | 'fastly';
-  deploy(manifest: EdgeDeploymentManifest): Promise<void>;
+export interface EdgeExecution {
+  context: EdgeRequestContext;
+  /** Functions that ran, in order. */
+  applied: string[];
+  /** Functions that timed out or threw, with the reason. */
+  failed: Array<{ name: string; reason: string }>;
+  result: EdgeResult;
 }
 
 export interface EdgeDeploymentManifest {
-  provider: string;
-  generatedAt: string;
+  provider: CDNProviderName;
+  regions: string[];
   functions: Array<{
     name: string;
     trigger: EdgeTrigger;
-    route: string;
+    routes: string[];
     priority: number;
-    memoryMb: number;
-    timeoutMs: number;
   }>;
 }
 
-/** Conservative platform-agnostic defaults. */
-const DEFAULT_MEMORY_MB = 128;
-const DEFAULT_TIMEOUT_MS = 50;
+export class EdgeFunctionTimeout extends Error {
+  constructor(name: string, timeoutMs: number) {
+    super(`edge function "${name}" exceeded ${timeoutMs}ms`);
+    this.name = "EdgeFunctionTimeout";
+  }
+}
 
 export class EdgeFunctionsService {
-  private readonly functions = new Map<string, EdgeFunctionDefinition>();
+  private functions = new Map<string, EdgeFunction>();
 
-  /**
-   * Register a function.
-   *
-   * Rejects an unknown trigger and an empty route rather than accepting them
-   * and failing at deploy time, when the feedback loop is minutes long.
-   */
-  register(definition: EdgeFunctionDefinition): void {
-    if (!definition.name.trim()) {
-      throw new Error('edge function requires a name');
-    }
-    if (!definition.route.trim()) {
-      throw new Error(`edge function "${definition.name}" requires a route`);
-    }
+  constructor(private readonly config: CDNConfiguration = cdnConfig) {}
 
-    const wildcards = segments(definition.route).filter((s) => s === '*').length;
-    if (wildcards > 1) {
-      throw new Error(
-        `edge function "${definition.name}" has more than one wildcard; only a single trailing * is supported`,
-      );
-    }
-
-    this.functions.set(definition.name, definition);
+  register(fn: EdgeFunction): void {
+    this.functions.set(fn.name, fn);
   }
 
   unregister(name: string): void {
     this.functions.delete(name);
   }
 
-  /** Toggle without unregistering, so rollback is a flag flip. */
-  setEnabled(name: string, enabled: boolean): boolean {
-    const fn = this.functions.get(name);
-    if (!fn) return false;
-    this.functions.set(name, { ...fn, enabled });
-    return true;
+  list(): EdgeFunction[] {
+    return [...this.functions.values()].sort(
+      (a, b) => (a.priority ?? 100) - (b.priority ?? 100),
+    );
   }
 
-  list(): EdgeFunctionDefinition[] {
-    return [...this.functions.values()];
+  /** Functions that apply to a path for a trigger, in priority order. */
+  matching(trigger: EdgeTrigger, path: string): EdgeFunction[] {
+    return this.list().filter(
+      (fn) =>
+        fn.trigger === trigger &&
+        (fn.routes.length === 0 ||
+          fn.routes.some((route) => path.startsWith(route))),
+    );
   }
 
   /**
-   * Resolve which function handles `path` for `trigger`.
+   * Run the chain for a request.
    *
-   * Ties break on explicit priority first, then specificity — an exact route
-   * should win over a wildcard even if the wildcard was registered later.
+   * Results merge: later headers overwrite earlier ones, the last rewrite wins,
+   * and the first redirect or response ends the chain. A function that throws
+   * or overruns its budget is skipped and recorded — one broken transform must
+   * not take the request down with it.
    */
-  resolve(trigger: EdgeTrigger, path: string): EdgeMatch | null {
-    let best: EdgeMatch | null = null;
-    let bestScore = -Infinity;
+  async execute(
+    trigger: EdgeTrigger,
+    context: EdgeRequestContext,
+  ): Promise<EdgeExecution> {
+    const execution: EdgeExecution = {
+      context,
+      applied: [],
+      failed: [],
+      result: { headers: {} },
+    };
 
-    for (const definition of this.functions.values()) {
-      if (definition.enabled === false) continue;
-      if (definition.trigger !== trigger) continue;
+    if (!this.config.edge.enabled) return execution;
 
-      const params = matchRoute(definition.route, path);
-      if (!params) continue;
+    for (const fn of this.matching(trigger, context.path)) {
+      try {
+        const result = await withTimeout(
+          Promise.resolve(fn.handler(context)),
+          this.config.edge.timeoutMs,
+          fn.name,
+        );
+        execution.applied.push(fn.name);
 
-      const score =
-        (definition.priority ?? 0) * 1000 + routeSpecificity(definition.route);
-
-      if (score > bestScore) {
-        best = { definition, params };
-        bestScore = score;
+        if (result.headers) {
+          execution.result.headers = {
+            ...execution.result.headers,
+            ...result.headers,
+          };
+        }
+        if (result.rewritePath)
+          execution.result.rewritePath = result.rewritePath;
+        if (result.redirect) {
+          execution.result.redirect = result.redirect;
+          break;
+        }
+        if (result.respond) {
+          execution.result.respond = result.respond;
+          break;
+        }
+      } catch (err) {
+        const reason = (err as Error).message;
+        execution.failed.push({ name: fn.name, reason });
+        logger.warn(`Edge function ${fn.name} skipped: ${reason}`);
       }
     }
 
-    return best;
+    return execution;
   }
 
-  /** Every function that matches, highest precedence first. */
-  resolveAll(trigger: EdgeTrigger, path: string): EdgeMatch[] {
-    return this.list()
-      .filter((d) => d.enabled !== false && d.trigger === trigger)
-      .map((definition) => ({ definition, params: matchRoute(definition.route, path) }))
-      .filter((m): m is EdgeMatch => m.params !== null)
-      .sort(
-        (a, b) =>
-          (b.definition.priority ?? 0) * 1000 +
-          routeSpecificity(b.definition.route) -
-          ((a.definition.priority ?? 0) * 1000 + routeSpecificity(a.definition.route)),
-      );
-  }
-
-  /**
-   * Build the deployment manifest.
-   *
-   * Disabled functions are excluded: deploying an inactive function to the
-   * edge and relying on a runtime flag wastes PoP memory and makes the
-   * deployed set differ from the intended one.
-   */
-  buildManifest(provider: string, now: Date = new Date()): EdgeDeploymentManifest {
+  /** Describe the registered functions for a provider's deployment step. */
+  manifest(
+    provider: CDNProviderName = this.config.primary,
+  ): EdgeDeploymentManifest {
     return {
       provider,
-      generatedAt: now.toISOString(),
-      functions: this.list()
-        .filter((d) => d.enabled !== false)
-        .sort((a, b) => (b.priority ?? 0) - (a.priority ?? 0))
-        .map((d) => ({
-          name: d.name,
-          trigger: d.trigger,
-          route: d.route,
-          priority: d.priority ?? 0,
-          memoryMb: d.memoryMb ?? DEFAULT_MEMORY_MB,
-          timeoutMs: d.timeoutMs ?? DEFAULT_TIMEOUT_MS,
-        })),
+      regions: this.config.edge.regions,
+      functions: this.list().map((fn) => ({
+        name: fn.name,
+        trigger: fn.trigger,
+        routes: fn.routes,
+        priority: fn.priority ?? 100,
+      })),
     };
   }
+}
 
-  /** Deploy through a target adapter. */
-  async deploy(target: EdgeDeploymentTarget, now: Date = new Date()): Promise<void> {
-    await target.deploy(this.buildManifest(target.provider, now));
-  }
-
-  clear(): void {
-    this.functions.clear();
+/**
+ * Reject once `timeoutMs` elapses.
+ *
+ * The underlying promise is not cancellable, so it keeps running; the point is
+ * to stop the request waiting on it.
+ */
+export async function withTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+  name: string,
+): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(
+          () => reject(new EdgeFunctionTimeout(name, timeoutMs)),
+          timeoutMs,
+        );
+        timer.unref?.();
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
   }
 }
+
+// ─── Built-in functions ──────────────────────────────────────────────────────
+
+/**
+ * Route a request to the nearest content variant by country.
+ *
+ * `regionMap` maps ISO country codes to a region slug; unmapped countries fall
+ * through to `defaultRegion`.
+ */
+export function geoRoutingFunction(
+  regionMap: Record<string, string>,
+  defaultRegion: string,
+): EdgeFunction {
+  return {
+    name: "geo-routing",
+    trigger: "viewer-request",
+    routes: [],
+    priority: 10,
+    handler: (ctx) => {
+      const region =
+        (ctx.country && regionMap[ctx.country.toUpperCase()]) || defaultRegion;
+      return { headers: { "x-mm-region": region } };
+    },
+  };
+}
+
+/** Add the cache-relevant Vary header for negotiated image responses. */
+export function imageVaryFunction(): EdgeFunction {
+  return {
+    name: "image-vary",
+    trigger: "viewer-response",
+    routes: ["/api/v1/media", "/assets"],
+    priority: 20,
+    handler: () => ({ headers: { vary: "Accept, Accept-Encoding" } }),
+  };
+}
+
+export const edgeFunctions = new EdgeFunctionsService();

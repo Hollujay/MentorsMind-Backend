@@ -75,10 +75,11 @@ export class StripeServiceClass {
         try {
           await client.query('BEGIN');
 
-          const insertTx = `INSERT INTO transactions (user_id, booking_id, type, status, amount, currency, description, created_at, updated_at)
-            VALUES ($1, $2, 'payment', 'completed', $3, $4, $5, NOW(), NOW()) RETURNING id`;
+          const insertTx = `INSERT INTO transactions
+            (user_id, booking_id, type, status, amount, currency, payment_rail, external_reference, description, created_at, updated_at)
+            VALUES ($1, $2, 'payment', 'completed', $3, $4, 'stripe', $5, $6, NOW(), NOW()) RETURNING id`;
           const desc = `stripe_charge:${charge.id}`;
-          const { rows } = await client.query(insertTx, [userId, bookingId, amount, currency, desc]);
+          const { rows } = await client.query(insertTx, [userId, bookingId, amount, currency, charge.id, desc]);
           const transactionId = rows[0].id;
 
           // Mark booking as paid and link transaction

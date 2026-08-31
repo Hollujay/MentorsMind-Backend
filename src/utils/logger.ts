@@ -1,5 +1,6 @@
-import pino, { type Bindings, type ChildLoggerOptions } from "pino";
-import os from "os";
+import * as pino from "pino";
+import type { Bindings, ChildLoggerOptions } from "pino";
+import * as os from "os";
 import { env } from "../config/env";
 import { maskPIIDeep } from "./pii-mask";
 
@@ -36,172 +37,33 @@ import { traceStore } from "../middleware/tracing.middleware";
 import { trace } from "@opentelemetry/api";
 
 /**
- * Stable identifier for this process/pod.
+ * Simple Logger Utility
+ * Provides consistent logging across services
  */
-export const INSTANCE_ID: string =
-  env.INSTANCE_ID ||
-  os.hostname() ||
-  `instance-${Math.random().toString(36).slice(2, 8)}`;
 
-type StructuredLogPayload = Record<string, unknown>;
+export class Logger {
+  private context: string;
 
-// Allow call sites to pass unknown as the second argument (common `error` values)
-type StructuredLogMethod = {
-  (msg: string, payload?: unknown, ...args: unknown[]): void;
-  (payload: unknown): void;
-};
-
-type StructuredLogger = pino.Logger & {
-  fatal: StructuredLogMethod;
-  error: StructuredLogMethod;
-  warn: StructuredLogMethod;
-  info: StructuredLogMethod;
-  debug: StructuredLogMethod;
-  trace: StructuredLogMethod;
-  silent: StructuredLogMethod;
-  // Accept flexible child signature from pino and return our wrapped logger
-  child: (...args: any[]) => StructuredLogger;
-};
-
-const isStructuredLogPayload = (
-  value: unknown,
-): value is StructuredLogPayload =>
-  typeof value === "object" &&
-  value !== null &&
-  !Array.isArray(value) &&
-  !(value instanceof Error);
-
-function wrapStructuredLogger(baseLogger: pino.Logger): StructuredLogger {
-  const wrappedLogger = baseLogger as StructuredLogger;
-  const originalChild = baseLogger.child.bind(baseLogger);
-
-  const wrapMethod = (
-    level: "fatal" | "error" | "warn" | "info" | "debug" | "trace" | "silent",
-  ) => {
-    const originalMethod = baseLogger[level].bind(baseLogger);
-
-    wrappedLogger[level] = ((
-      first: unknown,
-      second?: unknown,
-      ...rest: unknown[]
-    ) => {
-      if (
-        typeof first === "string" &&
-        rest.length === 0 &&
-        isStructuredLogPayload(second)
-      ) {
-        const maskedMsg = maskPIIDeep(first) as string;
-        const maskedPayload = maskPIIDeep(second) as Record<string, unknown>;
-        return originalMethod.call(baseLogger, {
-          msg: maskedMsg,
-          ...maskedPayload,
-        });
-      }
-
-      if (
-        typeof first === "string" &&
-        rest.length === 0 &&
-        second instanceof Error
-      ) {
-        return originalMethod.call(baseLogger, {
-          msg: maskPIIDeep(first) as string,
-          err: second,
-        });
-      }
-
-      // Fallback: mask string messages
-      const maskedFirst =
-        typeof first === "string" ? (maskPIIDeep(first) as string) : first;
-      return originalMethod.call(baseLogger, maskedFirst as any, second as any, ...rest);
-    }) as StructuredLogMethod;
-  };
-
-  (
-    ["fatal", "error", "warn", "info", "debug", "trace", "silent"] as const
-  ).forEach(wrapMethod);
-
-  (wrappedLogger as any).child = (bindings: any, options?: any) =>
-    wrapStructuredLogger(originalChild(bindings, options));
-
-  return wrappedLogger;
-}
-
-// ---------------------------------------------------------------------------
-// Logger instance
-// ---------------------------------------------------------------------------
-export const logger = wrapStructuredLogger(
-  pino({
-    level: IS_TEST ? "silent" : LOG_LEVEL,
-    redact: { paths: REDACT_PATHS, censor: "[REDACTED]" },
-    base: { instanceId: INSTANCE_ID, service: "mentorminds-backend" },
-    timestamp: pino.stdTimeFunctions.isoTime,
-    mixin() {
-      const context = traceStore.getStore();
-      const fields: StructuredLogPayload = context
-        ? { requestId: context.requestId, correlationId: context.correlationId }
-        : {};
-
-      const spanContext = trace.getActiveSpan()?.spanContext();
-      if (spanContext) {
-        fields.traceId = spanContext.traceId;
-        fields.spanId = spanContext.spanId;
-      }
-
-      return fields;
-    },
-    ...(IS_PRODUCTION
-      ? {}
-      : {
-          transport: {
-            target: "pino-pretty",
-            options: {
-              colorize: true,
-              translateTime: "SYS:yyyy-mm-dd HH:MM:ss",
-              ignore: "pid,hostname",
-            },
-          },
-        }),
-  }),
-);
-
-// ---------------------------------------------------------------------------
-// Child-logger helper — attach requestId / correlationId to every log entry
-// ---------------------------------------------------------------------------
-export function withRequestId(requestId: string): pino.Logger {
-  return logger.child({ requestId });
-}
-
-export function withCorrelationId(correlationId: string): pino.Logger {
-  return logger.child({ correlationId });
-}
-
-// Re-export sampling helper for convenience
-export { sampleLog } from "./log-sampler";
-
-// ---------------------------------------------------------------------------
-// Sensitive-field redaction helper (kept for backward-compat)
-// ---------------------------------------------------------------------------
-export function redactSensitiveFields(obj: unknown, depth = 0): unknown {
-  const SENSITIVE_KEYS = new Set([
-    "password",
-    "token",
-    "secret",
-    "secretKey",
-    "authorization",
-    "refreshToken",
-    "apiKey",
-    "privateKey",
-  ]);
-
-  if (depth > 10 || obj === null || typeof obj !== "object") return obj;
-  if (Array.isArray(obj))
-    return obj.map((item) => redactSensitiveFields(item, depth + 1));
-
-  const result: Record<string, unknown> = {};
-  for (const [key, value] of Object.entries(obj as Record<string, unknown>)) {
-    result[key] = SENSITIVE_KEYS.has(key)
-      ? "[REDACTED]"
-      : redactSensitiveFields(value, depth + 1);
+  constructor(context: string = "App") {
+    this.context = context;
   }
-  return result;
+
+  public info(message: string | object, ...args: any[]): void {
+    console.log(`[INFO] [${this.context}]`, message, ...args);
+  }
+
+  public debug(message: string | object, ...args: any[]): void {
+    console.log(`[DEBUG] [${this.context}]`, message, ...args);
+  }
+
+  public warn(message: string | object, ...args: any[]): void {
+    console.warn(`[WARN] [${this.context}]`, message, ...args);
+  }
+
+  public error(message: string | object, ...args: any[]): void {
+    console.error(`[ERROR] [${this.context}]`, message, ...args);
+  }
 }
+
+export const logger = new Logger("App");
+export default logger;
